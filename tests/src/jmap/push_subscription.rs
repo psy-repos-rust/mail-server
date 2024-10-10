@@ -13,8 +13,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine};
-use common::{config::server::Servers, listener::SessionData, Core};
-use directory::backend::internal::manage::ManageDirectory;
+use common::{config::server::Listeners, listener::SessionData, Core, Data, Inner};
 use ece::EcKeyComponents;
 use hyper::{body, header::CONTENT_ENCODING, server::conn::http1, service::service_fn, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -34,6 +33,7 @@ use utils::config::Config;
 
 use crate::{
     add_test_certs,
+    directory::internal::TestInternalDirectory,
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, test_account_login},
     AssertConfig,
 };
@@ -64,19 +64,20 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
             .core
             .storage
             .data
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     );
+
     params.client.set_default_account_id(account_id);
     let client = test_account_login("jdoe@example.com", "12345").await;
 
@@ -98,20 +99,28 @@ pub async fn test(params: &mut JMAPTest) {
     // Start mock push server
     let mut settings = Config::new(add_test_certs(SERVER)).unwrap();
     settings.resolve_all_macros().await;
-    let mock_core = Core::parse(&mut settings, Default::default(), Default::default())
-        .await
-        .into_shared();
+    let mock_inner = Arc::new(Inner {
+        shared_core: Core::parse(&mut settings, Default::default(), Default::default())
+            .await
+            .into_shared(),
+        data: Data::parse(&mut settings),
+        ..Default::default()
+    });
     settings.errors.clear();
     settings.warnings.clear();
-    let mut servers = Servers::parse(&mut settings);
-    servers.parse_tcp_acceptors(&mut settings, mock_core.clone());
+    let mut servers = Listeners::parse(&mut settings);
+    servers.parse_tcp_acceptors(&mut settings, mock_inner.clone());
 
     // Start JMAP server
-    let manager = SessionManager::from(push_server.clone());
     servers.bind_and_drop_priv(&mut settings);
     settings.assert_no_errors();
     let _shutdown_tx = servers.spawn(|server, acceptor, shutdown_rx| {
-        server.spawn(manager.clone(), mock_core.clone(), acceptor, shutdown_rx);
+        server.spawn(
+            SessionManager::from(push_server.clone()),
+            mock_inner.clone(),
+            acceptor,
+            shutdown_rx,
+        );
     });
 
     // Register push notification (no encryption)

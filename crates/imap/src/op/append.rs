@@ -6,6 +6,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use directory::Permission;
 use imap_proto::{
     protocol::{append::Arguments, select::HighestModSeq},
     receiver::Request,
@@ -13,11 +14,14 @@ use imap_proto::{
 };
 
 use crate::{
-    core::{ImapUidToId, MailboxId, SelectedMailbox, Session, SessionData},
+    core::{ImapUidToId, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-use common::listener::SessionStream;
-use jmap::email::ingest::{IngestEmail, IngestSource};
+use common::{listener::SessionStream, MailboxId};
+use jmap::{
+    email::ingest::{EmailIngest, IngestEmail, IngestSource},
+    services::state::StateManager,
+};
 use jmap_proto::types::{acl::Acl, keyword::Keyword, state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
 
@@ -25,6 +29,9 @@ use super::{ImapContext, ToModSeq};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_append(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapAppend)?;
+
         let op_start = Instant::now();
         let arguments = request.parse_append(self.version)?;
         let (data, selected_mailbox) = self.state.session_mailbox_state();
@@ -84,11 +91,12 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         // Obtain quota
-        let account_quota = self
-            .get_access_token()
+        let resource_token = self
+            .server
+            .get_cached_access_token(mailbox.account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?
-            .quota as i64;
+            .as_resource_token();
 
         // Append messages
         let mut response = StatusResponse::completed(Command::Append);
@@ -96,17 +104,16 @@ impl<T: SessionStream> SessionData<T> {
         let mut last_change_id = None;
         for message in arguments.messages {
             match self
-                .jmap
+                .server
                 .email_ingest(IngestEmail {
                     raw_message: &message.message,
                     message: MessageParser::new().parse(&message.message),
-                    account_id,
-                    account_quota,
+                    resource: resource_token.clone(),
                     mailbox_ids: vec![mailbox_id],
                     keywords: message.flags.into_iter().map(Keyword::from).collect(),
                     received_at: message.received_at.map(|d| d as u64),
                     source: IngestSource::Imap,
-                    encrypt: self.jmap.core.jmap.encrypt && self.jmap.core.jmap.encrypt_append,
+                    encrypt: self.server.core.jmap.encrypt && self.server.core.jmap.encrypt_append,
                     session_id: self.session_id,
                 })
                 .await
@@ -123,6 +130,9 @@ impl<T: SessionStream> SessionData<T> {
                         if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) {
                             err.details("Disk quota exceeded.")
                                 .code(ResponseCode::OverQuota)
+                        } else if err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) {
+                            err.details("Organization disk quota exceeded.")
+                                .code(ResponseCode::OverQuota)
                         } else {
                             err
                         }
@@ -134,7 +144,7 @@ impl<T: SessionStream> SessionData<T> {
 
         // Broadcast changes
         if let Some(change_id) = last_change_id {
-            self.jmap
+            self.server
                 .broadcast_state_change(
                     StateChange::new(account_id)
                         .with_change(DataType::Email, change_id)

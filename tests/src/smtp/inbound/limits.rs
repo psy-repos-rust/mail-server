@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use common::Core;
 use tokio::sync::watch;
 
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 use utils::config::Config;
 
 use crate::smtp::{
-    build_smtp,
     session::{TestSession, VerifyResponse},
+    TestSMTP,
 };
 
 const CONFIG: &str = r#"
@@ -29,8 +29,8 @@ duration = [{if = "remote_ip = '10.0.0.3'", then = '500ms'},
 
 #[tokio::test]
 async fn limits() {
-        // Enable logging
-        crate::enable_logging();
+    // Enable logging
+    crate::enable_logging();
 
     let mut config = Config::new(CONFIG).unwrap();
     let core = Core::parse(&mut config, Default::default(), Default::default()).await;
@@ -38,7 +38,7 @@ async fn limits() {
     let (_tx, rx) = watch::channel(true);
 
     // Exceed max line length
-    let mut session = Session::test_with_shutdown(build_smtp(core, Inner::default()), rx);
+    let mut session = Session::test_with_shutdown(TestSMTP::from_core(core).server, rx);
     session.data.remote_ip_str = "10.0.0.1".to_string();
     let mut buf = vec![b'A'; 2049];
     session.ingest(&buf).await.unwrap();

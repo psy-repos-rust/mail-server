@@ -7,7 +7,7 @@ homepage = "https://stalw.art"
 keywords = ["imap", "jmap", "smtp", "email", "mail", "server"]
 categories = ["email"]
 license = "AGPL-3.0-only OR LicenseRef-SEL"
-version = "0.9.4"
+version = "0.10.4"
 edition = "2021"
 resolver = "2"
 
@@ -44,4 +44,4 @@ rocks = ["store/rocks"]
 elastic = ["store/elastic"]
 s3 = ["store/s3"]
 redis = ["store/redis"]
-enterprise = ["jmap/enterprise", "common/enterprise", "store/enterprise"]
+enterprise = ["jmap/enterprise", "common/enterprise", "store/enterprise", "managesieve/enterprise", "directory/enterprise"]

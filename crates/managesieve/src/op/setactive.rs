@@ -6,16 +6,21 @@
 
 use std::time::Instant;
 
+use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::receiver::Request;
+use jmap::{changes::write::ChangeLog, sieve::set::SieveScriptSet};
 use jmap_proto::types::collection::Collection;
 use store::write::log::ChangeLogBuilder;
-use tokio::io::{AsyncRead, AsyncWrite};
 use trc::AddContext;
 
 use crate::core::{Command, Session, StatusResponse};
 
-impl<T: AsyncRead + AsyncWrite> Session<T> {
+impl<T: SessionStream> Session<T> {
     pub async fn handle_setactive(&mut self, request: Request<Command>) -> trc::Result<Vec<u8>> {
+        // Validate access
+        self.assert_has_permission(Permission::SieveSetActive)?;
+
         let op_start = Instant::now();
         let name = request
             .tokens
@@ -31,7 +36,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
         // De/activate script
         let account_id = self.state.access_token().primary_id();
         let changes = self
-            .jmap
+            .server
             .sieve_activate_script(
                 account_id,
                 if !name.is_empty() {
@@ -49,7 +54,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
             for (document_id, _) in changes {
                 changelog.log_update(Collection::SieveScript, document_id);
             }
-            self.jmap
+            self.server
                 .commit_changes(account_id, changelog)
                 .await
                 .caused_by(trc::location!())?;

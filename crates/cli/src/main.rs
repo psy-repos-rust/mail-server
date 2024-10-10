@@ -31,6 +31,7 @@ async fn main() -> std::io::Result<()> {
     let url = args
         .url
         .or_else(|| std::env::var("URL").ok())
+        .map(|url| url.trim_end_matches('/').to_string())
         .unwrap_or_else(|| {
             eprintln!("No URL specified. Use --url or set the URL environment variable.");
             std::process::exit(1);
@@ -63,10 +64,10 @@ async fn main() -> std::io::Result<()> {
             command.exec(client).await;
         }
         Commands::Server(command) => command.exec(client).await,
-        Commands::Account(command) => command.exec(client).await,
+        /*Commands::Account(command) => command.exec(client).await,
         Commands::Domain(command) => command.exec(client).await,
         Commands::List(command) => command.exec(client).await,
-        Commands::Group(command) => command.exec(client).await,
+        Commands::Group(command) => command.exec(client).await,*/
         Commands::Queue(command) => command.exec(client).await,
         Commands::Report(command) => command.exec(client).await,
     }
@@ -88,7 +89,7 @@ async fn oauth(url: &str) -> Credentials {
             .danger_accept_invalid_certs(is_localhost(url))
             .build()
             .unwrap_or_default()
-            .get(&format!("{}/.well-known/oauth-authorization-server", url))
+            .get(format!("{}/.well-known/oauth-authorization-server", url))
             .send()
             .await
             .unwrap_result("send OAuth GET request")

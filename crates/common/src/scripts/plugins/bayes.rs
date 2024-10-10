@@ -43,8 +43,8 @@ pub async fn exec_untrain(ctx: PluginContext<'_>) -> trc::Result<Variable> {
 
 async fn train(ctx: PluginContext<'_>, is_train: bool) -> trc::Result<Variable> {
     let store = match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.lookups.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.lookup),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -63,10 +63,7 @@ async fn train(ctx: PluginContext<'_>, is_train: bool) -> trc::Result<Variable> 
     // Train the model
     let mut model = BayesModel::default();
     model.train(
-        OsbTokenizer::new(
-            BayesTokenizer::new(text.as_ref(), &ctx.core.smtp.resolvers.psl),
-            5,
-        ),
+        OsbTokenizer::new(BayesTokenizer::new(text.as_ref()), 5),
         is_spam,
     );
     if model.weights.is_empty() {
@@ -83,7 +80,7 @@ async fn train(ctx: PluginContext<'_>, is_train: bool) -> trc::Result<Variable> 
     );
 
     // Update weight and invalidate cache
-    let bayes_cache = &ctx.cache.bayes_cache;
+    let bayes_cache = &ctx.server.inner.data.bayes_cache;
     if is_train {
         for (hash, weights) in model.weights {
             store
@@ -132,8 +129,8 @@ async fn train(ctx: PluginContext<'_>, is_train: bool) -> trc::Result<Variable> 
 
 pub async fn exec_classify(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let store = match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.lookups.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.lookup),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -165,7 +162,7 @@ pub async fn exec_classify(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     }
 
     // Obtain training counts
-    let bayes_cache = &ctx.cache.bayes_cache;
+    let bayes_cache = &ctx.server.inner.data.bayes_cache;
     let (spam_learns, ham_learns) = bayes_cache
         .get_or_update(TokenHash::default(), store)
         .await
@@ -187,10 +184,7 @@ pub async fn exec_classify(ctx: PluginContext<'_>) -> trc::Result<Variable> {
 
     // Classify the text
     let mut tokens = Vec::new();
-    for token in OsbTokenizer::<_, TokenHash>::new(
-        BayesTokenizer::new(text.as_ref(), &ctx.core.smtp.resolvers.psl),
-        5,
-    ) {
+    for token in OsbTokenizer::<_, TokenHash>::new(BayesTokenizer::new(text.as_ref()), 5) {
         let weights = bayes_cache.get_or_update(token.inner, store).await?;
         tokens.push(OsbToken {
             inner: weights,
@@ -225,8 +219,8 @@ pub async fn exec_is_balanced(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     }
 
     let store = match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.lookups.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.lookup),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -237,7 +231,7 @@ pub async fn exec_is_balanced(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let learn_spam = ctx.arguments[1].to_bool();
 
     // Obtain training counts
-    let bayes_cache = &ctx.cache.bayes_cache;
+    let bayes_cache = &ctx.server.inner.data.bayes_cache;
     let (spam_learns, ham_learns) = bayes_cache
         .get_or_update(TokenHash::default(), store)
         .await

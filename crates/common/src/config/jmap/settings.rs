@@ -9,7 +9,6 @@ use std::{str::FromStr, time::Duration};
 use jmap_proto::request::capability::BaseCapabilities;
 use mail_parser::HeaderName;
 use nlp::language::Language;
-use store::rand::{distributions::Alphanumeric, thread_rng, Rng};
 use utils::config::{cron::SimpleCron, utils::ParseValue, Config, Rate};
 
 #[derive(Default, Clone)]
@@ -63,13 +62,6 @@ pub struct JmapConfig {
     pub web_socket_timeout: Duration,
     pub web_socket_heartbeat: Duration,
 
-    pub oauth_key: String,
-    pub oauth_expiry_user_code: u64,
-    pub oauth_expiry_auth_code: u64,
-    pub oauth_expiry_token: u64,
-    pub oauth_expiry_refresh_token: u64,
-    pub oauth_expiry_refresh_token_renew: u64,
-    pub oauth_max_auth_attempts: u32,
     pub fallback_admin: Option<(String, String)>,
     pub master_user: Option<(String, String)>,
 
@@ -82,8 +74,6 @@ pub struct JmapConfig {
 
     pub encrypt: bool,
     pub encrypt_append: bool,
-
-    pub principal_allow_lookups: bool,
 
     pub capabilities: BaseCapabilities,
     pub session_purge_frequency: SimpleCron,
@@ -323,39 +313,6 @@ impl JmapConfig {
             rate_anonymous: config
                 .property_or_default::<Option<Rate>>("jmap.rate-limit.anonymous", "100/1m")
                 .unwrap_or_default(),
-            oauth_key: config
-                .value("oauth.key")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    thread_rng()
-                        .sample_iter(Alphanumeric)
-                        .take(64)
-                        .map(char::from)
-                        .collect::<String>()
-                }),
-            oauth_expiry_user_code: config
-                .property_or_default::<Duration>("oauth.expiry.user-code", "30m")
-                .unwrap_or_else(|| Duration::from_secs(30 * 60))
-                .as_secs(),
-            oauth_expiry_auth_code: config
-                .property_or_default::<Duration>("oauth.expiry.auth-code", "10m")
-                .unwrap_or_else(|| Duration::from_secs(10 * 60))
-                .as_secs(),
-            oauth_expiry_token: config
-                .property_or_default::<Duration>("oauth.expiry.token", "1h")
-                .unwrap_or_else(|| Duration::from_secs(60 * 60))
-                .as_secs(),
-            oauth_expiry_refresh_token: config
-                .property_or_default::<Duration>("oauth.expiry.refresh-token", "30d")
-                .unwrap_or_else(|| Duration::from_secs(30 * 24 * 60 * 60))
-                .as_secs(),
-            oauth_expiry_refresh_token_renew: config
-                .property_or_default::<Duration>("oauth.expiry.refresh-token-renew", "4d")
-                .unwrap_or_else(|| Duration::from_secs(4 * 24 * 60 * 60))
-                .as_secs(),
-            oauth_max_auth_attempts: config
-                .property_or_default("oauth.auth.max-attempts", "3")
-                .unwrap_or(10),
             event_source_throttle: config
                 .property_or_default("jmap.event-source.throttle", "1s")
                 .unwrap_or_else(|| Duration::from_secs(1)),
@@ -371,9 +328,6 @@ impl JmapConfig {
             push_max_total: config
                 .property_or_default("jmap.push.max-total", "100")
                 .unwrap_or(100),
-            principal_allow_lookups: config
-                .property("jmap.principal.allow-lookups")
-                .unwrap_or(true),
             encrypt: config
                 .property_or_default("storage.encryption.enable", "true")
                 .unwrap_or(true),

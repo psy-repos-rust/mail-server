@@ -12,6 +12,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::{
     parser::PushUnique,
     protocol::{
@@ -25,7 +26,13 @@ use imap_proto::{
     receiver::Request,
     Command, ResponseCode, ResponseType, StatusResponse,
 };
-use jmap::email::metadata::MessageMetadata;
+use jmap::{
+    blob::download::BlobDownload,
+    changes::{get::ChangesLookup, write::ChangeLog},
+    email::metadata::MessageMetadata,
+    services::state::StateManager,
+    JmapMethods,
+};
 use jmap_proto::types::{
     acl::Acl, collection::Collection, id::Id, keyword::Keyword, property::Property,
     state::StateChange, type_state::DataType,
@@ -44,6 +51,9 @@ impl<T: SessionStream> Session<T> {
         request: Request<Command>,
         is_uid: bool,
     ) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapFetch)?;
+
         let op_start = Instant::now();
         let arguments = request.parse_fetch()?;
 
@@ -123,7 +133,7 @@ impl<T: SessionStream> SessionData<T> {
         if let Some(changed_since) = arguments.changed_since {
             // Obtain changes since the modseq.
             let changelog = self
-                .jmap
+                .server
                 .changes_(
                     account_id,
                     Collection::Email,
@@ -276,7 +286,7 @@ impl<T: SessionStream> SessionData<T> {
         for (seqnum, uid, id) in ids {
             // Obtain attributes and keywords
             let (email, keywords) = if let (Some(email), Some(keywords)) = (
-                self.jmap
+                self.server
                     .get_property::<Bincode<MessageMetadata>>(
                         account_id,
                         Collection::Email,
@@ -285,7 +295,7 @@ impl<T: SessionStream> SessionData<T> {
                     )
                     .await
                     .imap_ctx(&arguments.tag, trc::location!())?,
-                self.jmap
+                self.server
                     .get_property::<HashedValue<Vec<Keyword>>>(
                         account_id,
                         Collection::Email,
@@ -312,7 +322,7 @@ impl<T: SessionStream> SessionData<T> {
             let raw_message = if needs_blobs {
                 // Retrieve raw message if needed
                 match self
-                    .jmap
+                    .server
                     .get_blob(&email.blob_hash, 0..usize::MAX)
                     .await
                     .imap_ctx(&arguments.tag, trc::location!())?
@@ -343,7 +353,7 @@ impl<T: SessionStream> SessionData<T> {
                 set_seen_flags && !keywords.inner.iter().any(|k| k == &Keyword::Seen);
             let thread_id = if needs_thread_id || set_seen_flag {
                 if let Some(thread_id) = self
-                    .jmap
+                    .server
                     .get_property::<u32>(account_id, Collection::Email, id, Property::ThreadId)
                     .await
                     .imap_ctx(&arguments.tag, trc::location!())?
@@ -475,7 +485,7 @@ impl<T: SessionStream> SessionData<T> {
                     }
                     Attribute::ModSeq => {
                         if let Ok(Some(modseq)) = self
-                            .jmap
+                            .server
                             .get_property::<u64>(account_id, Collection::Email, id, Property::Cid)
                             .await
                         {
@@ -520,7 +530,7 @@ impl<T: SessionStream> SessionData<T> {
         // Set Seen ids
         if !set_seen_ids.is_empty() {
             let mut changelog = self
-                .jmap
+                .server
                 .begin_changes(account_id)
                 .await
                 .imap_ctx(&arguments.tag, trc::location!())?;
@@ -535,7 +545,7 @@ impl<T: SessionStream> SessionData<T> {
                     .value(Property::Keywords, keywords.inner, F_VALUE)
                     .value(Property::Keywords, Keyword::Seen, F_BITMAP)
                     .value(Property::Cid, changelog.change_id, F_VALUE);
-                match self.jmap.write_batch(batch).await {
+                match self.server.write_batch(batch).await {
                     Ok(_) => {
                         changelog.log_update(Collection::Email, id);
                     }
@@ -549,12 +559,12 @@ impl<T: SessionStream> SessionData<T> {
             if !changelog.is_empty() {
                 // Write changes
                 let change_id = self
-                    .jmap
+                    .server
                     .commit_changes(account_id, changelog)
                     .await
                     .imap_ctx(&arguments.tag, trc::location!())?;
                 modseq = change_id.into();
-                self.jmap
+                self.server
                     .broadcast_state_change(
                         StateChange::new(account_id).with_change(DataType::Email, change_id),
                     )

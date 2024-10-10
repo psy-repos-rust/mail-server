@@ -7,11 +7,15 @@
 use std::{borrow::Cow, net::IpAddr, sync::Arc};
 
 use common::{
+    auth::{oauth::GrantType, AccessToken},
+    core::BuildServer,
     expr::{functions::ResolveVariable, *},
+    ipc::StateEvent,
     listener::{ServerInstance, SessionData, SessionManager, SessionStream},
     manager::webadmin::Resource,
-    Core,
+    Inner, Server,
 };
+use directory::Permission;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{self, Bytes},
@@ -27,17 +31,33 @@ use jmap_proto::{
     response::Response,
     types::{blob::BlobId, id::Id},
 };
+use std::future::Future;
+use trc::SecurityEvent;
+
+#[cfg(feature = "enterprise")]
+use crate::api::management::enterprise::telemetry::TelemetryApi;
 
 use crate::{
-    auth::{authenticate::HttpHeaders, oauth::OAuthMetadata},
-    blob::{DownloadResponse, UploadResponse},
-    services::state,
-    JmapInstance, JMAP,
+    auth::{
+        authenticate::{Authenticator, HttpHeaders},
+        oauth::{
+            auth::OAuthApiHandler, openid::OpenIdHandler, registration::ClientRegistrationHandler,
+            token::TokenHandler, FormData,
+        },
+        rate_limit::RateLimiter,
+    },
+    blob::{download::BlobDownload, upload::BlobUpload, DownloadResponse, UploadResponse},
+    websocket::upgrade::WebSocketUpgrade,
 };
 
 use super::{
-    management::ManagementApiError, HtmlResponse, HttpRequest, HttpResponse, HttpResponseBody,
-    JmapSessionManager, JsonResponse,
+    autoconfig::Autoconfig,
+    event_source::EventSourceHandler,
+    form::FormHandler,
+    management::{ManagementApi, ManagementApiError},
+    request::RequestHandler,
+    session::SessionHandler,
+    HtmlResponse, HttpRequest, HttpResponse, HttpResponseBody, JmapSessionManager, JsonResponse,
 };
 
 pub struct HttpSessionData {
@@ -50,8 +70,16 @@ pub struct HttpSessionData {
     pub session_id: u64,
 }
 
-impl JMAP {
-    pub async fn parse_http_request(
+pub trait ParseHttp: Sync + Send {
+    fn parse_http_request(
+        &self,
+        req: HttpRequest,
+        session: HttpSessionData,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl ParseHttp for Server {
+    async fn parse_http_request(
         &self,
         mut req: HttpRequest,
         session: HttpSessionData,
@@ -61,7 +89,7 @@ impl JMAP {
 
         // Validate endpoint access
         let ctx = HttpContext::new(&session, &req);
-        match ctx.has_endpoint_access(&self.core).await {
+        match ctx.has_endpoint_access(self).await {
             StatusCode::OK => (),
             status => {
                 // Allow loopback address to avoid lockouts
@@ -77,11 +105,11 @@ impl JMAP {
                     ("", &Method::POST) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                            self.authenticate_headers(&req, &session, false).await?;
 
                         let request = fetch_body(
                             &mut req,
-                            if !access_token.is_super_user() {
+                            if !access_token.has_permission(Permission::UnlimitedUploads) {
                                 self.core.jmap.upload_max_size
                             } else {
                                 0
@@ -106,7 +134,7 @@ impl JMAP {
                     ("download", &Method::GET) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                            self.authenticate_headers(&req, &session, false).await?;
 
                         if let (Some(_), Some(blob_id), Some(name)) = (
                             path.next().and_then(|p| Id::from_bytes(p.as_bytes())),
@@ -135,14 +163,14 @@ impl JMAP {
                     ("upload", &Method::POST) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                            self.authenticate_headers(&req, &session, false).await?;
 
                         if let Some(account_id) =
                             path.next().and_then(|p| Id::from_bytes(p.as_bytes()))
                         {
                             return match fetch_body(
                                 &mut req,
-                                if !access_token.is_super_user() {
+                                if !access_token.has_permission(Permission::UnlimitedUploads) {
                                     self.core.jmap.upload_max_size
                                 } else {
                                     0
@@ -170,14 +198,14 @@ impl JMAP {
                     ("eventsource", &Method::GET) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                            self.authenticate_headers(&req, &session, false).await?;
 
                         return self.handle_event_source(req, access_token).await;
                     }
                     ("ws", &Method::GET) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                            self.authenticate_headers(&req, &session, false).await?;
 
                         return self
                             .upgrade_websocket_connection(req, access_token, session)
@@ -193,26 +221,26 @@ impl JMAP {
                 ("jmap", &Method::GET) => {
                     // Authenticate request
                     let (_in_flight, access_token) =
-                        self.authenticate_headers(&req, &session).await?;
+                        self.authenticate_headers(&req, &session, false).await?;
 
-                    return Ok(self
-                        .handle_session_resource(
-                            ctx.resolve_response_url(&self.core).await,
-                            access_token,
-                        )
-                        .await?
-                        .into_http_response());
+                    return self
+                        .handle_session_resource(ctx.resolve_response_url(self).await, access_token)
+                        .await
+                        .map(|s| s.into_http_response());
                 }
                 ("oauth-authorization-server", &Method::GET) => {
                     // Limit anonymous requests
                     self.is_anonymous_allowed(&session.remote_ip).await?;
 
-                    return Ok(JsonResponse::new(OAuthMetadata::new(
-                        ctx.resolve_response_url(&self.core).await,
-                    ))
-                    .into_http_response());
+                    return self.handle_oauth_metadata(req, session).await;
                 }
-                ("acme-challenge", &Method::GET) if self.core.has_acme_http_providers() => {
+                ("openid-configuration", &Method::GET) => {
+                    // Limit anonymous requests
+                    self.is_anonymous_allowed(&session.remote_ip).await?;
+
+                    return self.handle_oidc_metadata(req, session).await;
+                }
+                ("acme-challenge", &Method::GET) if self.has_acme_http_providers() => {
                     if let Some(token) = path.next() {
                         return match self
                             .core
@@ -221,25 +249,19 @@ impl JMAP {
                             .key_get::<String>(format!("acme:{token}").into_bytes())
                             .await?
                         {
-                            Some(proof) => Ok(Resource {
-                                content_type: "text/plain",
-                                contents: proof.into_bytes(),
-                            }
-                            .into_http_response()),
+                            Some(proof) => Ok(Resource::new("text/plain", proof.into_bytes())
+                                .into_http_response()),
                             None => Err(trc::ResourceEvent::NotFound.into_err()),
                         };
                     }
                 }
                 ("mta-sts.txt", &Method::GET) => {
-                    if let Some(policy) = self.core.build_mta_sts_policy() {
-                        return Ok(Resource {
-                            content_type: "text/plain",
-                            contents: policy.to_string().into_bytes(),
-                        }
-                        .into_http_response());
+                    return if let Some(policy) = self.build_mta_sts_policy() {
+                        Ok(Resource::new("text/plain", policy.to_string().into_bytes())
+                            .into_http_response())
                     } else {
-                        return Err(trc::ResourceEvent::NotFound.into_err());
-                    }
+                        Err(trc::ResourceEvent::NotFound.into_err())
+                    };
                 }
                 ("mail-v1.xml", &Method::GET) => {
                     return self.handle_autoconfig_request(&req).await;
@@ -260,17 +282,39 @@ impl JMAP {
                 ("device", &Method::POST) => {
                     self.is_anonymous_allowed(&session.remote_ip).await?;
 
-                    let url = ctx.resolve_response_url(&self.core).await;
-                    return self
-                        .handle_device_auth(&mut req, url, session.session_id)
-                        .await;
+                    return self.handle_device_auth(&mut req, session).await;
                 }
                 ("token", &Method::POST) => {
                     self.is_anonymous_allowed(&session.remote_ip).await?;
 
+                    return self.handle_token_request(&mut req, session).await;
+                }
+                ("introspect", &Method::POST) => {
+                    // Authenticate request
+                    let (_in_flight, access_token) =
+                        self.authenticate_headers(&req, &session, false).await?;
+
                     return self
-                        .handle_token_request(&mut req, session.session_id)
+                        .handle_token_introspect(&mut req, &access_token, session.session_id)
                         .await;
+                }
+                ("userinfo", &Method::GET) => {
+                    // Authenticate request
+                    let (_in_flight, access_token) =
+                        self.authenticate_headers(&req, &session, false).await?;
+
+                    return self.handle_userinfo_request(&access_token).await;
+                }
+                ("register", &Method::POST) => {
+                    return self
+                        .handle_oauth_registration_request(&mut req, session)
+                        .await;
+                }
+                ("jwks.json", &Method::GET) => {
+                    // Limit anonymous requests
+                    self.is_anonymous_allowed(&session.remote_ip).await?;
+
+                    return Ok(self.core.oauth.oidc_jwks.clone().into_http_response());
                 }
                 (_, &Method::OPTIONS) => {
                     return Ok(StatusCode::NO_CONTENT.into_http_response());
@@ -284,11 +328,10 @@ impl JMAP {
                 }
 
                 // Authenticate user
-                match self.authenticate_headers(&req, &session).await {
+                match self.authenticate_headers(&req, &session, true).await {
                     Ok((_, access_token)) => {
-                        let body = fetch_body(&mut req, 1024 * 1024, session.session_id).await;
                         return self
-                            .handle_api_manage_request(&req, body, access_token, &session)
+                            .handle_api_manage_request(&mut req, access_token, &session)
                             .await;
                     }
                     Err(err) => {
@@ -302,27 +345,30 @@ impl JMAP {
                             if err.matches(trc::EventType::Auth(trc::AuthEvent::Failed))
                                 && self.core.is_enterprise_edition()
                             {
-                                if let Some((live_path, token)) = req
+                                if let Some((live_path, grant_type, token)) = req
                                     .uri()
                                     .path()
                                     .strip_prefix("/api/telemetry/")
                                     .and_then(|p| {
                                         p.strip_prefix("traces/live/")
-                                            .map(|t| ("traces", t))
+                                            .map(|t| ("traces", GrantType::LiveTracing, t))
                                             .or_else(|| {
                                                 p.strip_prefix("metrics/live/")
-                                                    .map(|t| ("metrics", t))
+                                                    .map(|t| ("metrics", GrantType::LiveMetrics, t))
                                             })
                                     })
                                 {
-                                    let (account_id, _, _) =
-                                        self.validate_access_token("live_telemetry", token).await?;
+                                    let token_info = self
+                                        .validate_access_token(grant_type.into(), token)
+                                        .await?;
 
                                     return self
                                         .handle_telemetry_api_request(
                                             &req,
                                             vec!["", live_path, "live"],
-                                            account_id,
+                                            &AccessToken::from_id(token_info.account_id)
+                                                .with_permission(Permission::MetricsLive)
+                                                .with_permission(Permission::TracingLive),
                                         )
                                         .await;
                                 }
@@ -353,11 +399,10 @@ impl JMAP {
                 }
             }
             "robots.txt" => {
-                return Ok(Resource {
-                    content_type: "text/plain",
-                    contents: b"User-agent: *\nDisallow: /\n".to_vec(),
-                }
-                .into_http_response());
+                return Ok(
+                    Resource::new("text/plain", b"User-agent: *\nDisallow: /\n".to_vec())
+                        .into_http_response(),
+                );
             }
             "healthz" => match path.next().unwrap_or_default() {
                 "live" => {
@@ -390,10 +435,10 @@ impl JMAP {
                             }
                         }
 
-                        return Ok(Resource {
-                            content_type: "text/plain; version=0.0.4",
-                            contents: self.core.export_prometheus_metrics().await?.into_bytes(),
-                        }
+                        return Ok(Resource::new(
+                            "text/plain; version=0.0.4",
+                            self.export_prometheus_metrics().await?.into_bytes(),
+                        )
                         .into_http_response());
                     }
                 }
@@ -402,225 +447,300 @@ impl JMAP {
                 }
                 _ => (),
             },
+            #[cfg(feature = "enterprise")]
+            "logo.svg" if self.is_enterprise_edition() => {
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+
+                match self
+                    .logo_resource(
+                        req.headers()
+                            .get(header::HOST)
+                            .and_then(|h| h.to_str().ok())
+                            .map(|h| h.rsplit_once(':').map_or(h, |(h, _)| h))
+                            .unwrap_or_default(),
+                    )
+                    .await
+                {
+                    Ok(Some(resource)) => {
+                        return Ok(resource.into_http_response());
+                    }
+                    Ok(None) => (),
+                    Err(err) => {
+                        trc::error!(err.span_id(session.session_id));
+                    }
+                }
+
+                let resource = self.inner.data.webadmin.get("logo.svg").await?;
+
+                if !resource.is_empty() {
+                    return Ok(resource.into_http_response());
+                }
+
+                // SPDX-SnippetEnd
+            }
+            "form" => {
+                if let Some(form) = &self.core.network.contact_form {
+                    match *req.method() {
+                        Method::POST => {
+                            self.is_anonymous_allowed(&session.remote_ip).await?;
+
+                            let form_data =
+                                FormData::from_request(&mut req, form.max_size, session.session_id)
+                                    .await?;
+
+                            return self.handle_contact_form(&session, form, form_data).await;
+                        }
+                        Method::OPTIONS => {
+                            return Ok(StatusCode::NO_CONTENT.into_http_response());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {
                 let path = req.uri().path();
                 let resource = self
                     .inner
+                    .data
                     .webadmin
                     .get(path.strip_prefix('/').unwrap_or(path))
                     .await?;
 
-                return if !resource.is_empty() {
-                    Ok(resource.into_http_response())
-                } else {
-                    Err(trc::ResourceEvent::NotFound.into_err())
-                };
+                if !resource.is_empty() {
+                    return Ok(resource.into_http_response());
+                }
             }
+        }
+
+        // Block dangerous URLs
+        let path = req.uri().path();
+        if self.is_http_banned_path(path, session.remote_ip).await? {
+            trc::event!(
+                Security(SecurityEvent::ScanBan),
+                SpanId = session.session_id,
+                RemoteIp = session.remote_ip,
+                Path = path.to_string(),
+            );
         }
 
         Err(trc::ResourceEvent::NotFound.into_err())
     }
 }
 
-impl JmapInstance {
-    async fn handle_session<T: SessionStream>(self, session: SessionData<T>) {
-        let _in_flight = session.in_flight;
-        let is_tls = session.stream.is_tls();
+async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionData<T>) {
+    let _in_flight = session.in_flight;
+    let is_tls = session.stream.is_tls();
 
-        if let Err(http_err) = http1::Builder::new()
-            .keep_alive(true)
-            .serve_connection(
-                TokioIo::new(session.stream),
-                service_fn(|req: hyper::Request<body::Incoming>| {
-                    let jmap_instance = self.clone();
-                    let instance = session.instance.clone();
+    if let Err(http_err) = http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(
+            TokioIo::new(session.stream),
+            service_fn(|req: hyper::Request<body::Incoming>| {
+                let instance = session.instance.clone();
+                let inner = inner.clone();
 
-                    async move {
-                        let jmap = JMAP::from(jmap_instance);
+                async move {
+                    let server = inner.build_server();
 
-                        // Obtain remote IP
-                        let remote_ip = if !jmap.core.jmap.http_use_forwarded {
-                            trc::event!(
-                                Http(trc::HttpEvent::RequestUrl),
-                                SpanId = session.session_id,
-                                Url = req.uri().to_string(),
-                            );
-
-                            session.remote_ip
-                        } else if let Some(forwarded_for) = req
-                            .headers()
-                            .get(header::FORWARDED)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|h| {
-                                let h = h.to_ascii_lowercase();
-                                h.split_once("for=").and_then(|(_, rest)| {
-                                    let mut start_ip = usize::MAX;
-                                    let mut end_ip = usize::MAX;
-
-                                    for (pos, ch) in rest.char_indices() {
-                                        match ch {
-                                            '0'..='9' | 'a'..='f' | ':' | '.' => {
-                                                if start_ip == usize::MAX {
-                                                    start_ip = pos;
-                                                }
-                                                end_ip = pos;
-                                            }
-                                            '"' | '[' | ' ' if start_ip == usize::MAX => {}
-                                            _ => {
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    rest.get(start_ip..=end_ip)
-                                        .and_then(|h| h.parse::<IpAddr>().ok())
-                                })
-                            })
-                            .or_else(|| {
-                                req.headers()
-                                    .get("X-Forwarded-For")
-                                    .and_then(|h| h.to_str().ok())
-                                    .map(|h| h.split_once(',').map_or(h, |(ip, _)| ip).trim())
-                                    .and_then(|h| h.parse::<IpAddr>().ok())
-                            })
-                        {
-                            trc::event!(
-                                Http(trc::HttpEvent::RequestUrl),
-                                SpanId = session.session_id,
-                                RemoteIp = forwarded_for,
-                                Url = req.uri().to_string(),
-                            );
-
-                            forwarded_for
-                        } else {
-                            trc::event!(
-                                Http(trc::HttpEvent::XForwardedMissing),
-                                SpanId = session.session_id,
-                            );
-                            session.remote_ip
-                        };
-
-                        // Parse HTTP request
-                        let response = match jmap
-                            .parse_http_request(
-                                req,
-                                HttpSessionData {
-                                    instance,
-                                    local_ip: session.local_ip,
-                                    local_port: session.local_port,
-                                    remote_ip,
-                                    remote_port: session.remote_port,
-                                    is_tls,
-                                    session_id: session.session_id,
-                                },
-                            )
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(err) => {
-                                let response = err.into_http_response();
-                                trc::error!(err.span_id(session.session_id));
-                                response
-                            }
-                        };
-
+                    // Obtain remote IP
+                    let remote_ip = if !server.core.jmap.http_use_forwarded {
                         trc::event!(
-                            Http(trc::HttpEvent::ResponseBody),
+                            Http(trc::HttpEvent::RequestUrl),
                             SpanId = session.session_id,
-                            Contents = match &response.body {
-                                HttpResponseBody::Text(value) => trc::Value::String(value.clone()),
-                                HttpResponseBody::Binary(_) => trc::Value::Static("[binary data]"),
-                                HttpResponseBody::Stream(_) => trc::Value::Static("[stream]"),
-                                _ => trc::Value::None,
-                            },
-                            Code = response.status.as_u16(),
-                            Size = response.size(),
+                            Url = req.uri().to_string(),
                         );
 
-                        // Build response
-                        let mut response = response.build();
+                        session.remote_ip
+                    } else if let Some(forwarded_for) = req
+                        .headers()
+                        .get(header::FORWARDED)
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|h| {
+                            let h = h.to_ascii_lowercase();
+                            h.split_once("for=").and_then(|(_, rest)| {
+                                let mut start_ip = usize::MAX;
+                                let mut end_ip = usize::MAX;
 
-                        // Add custom headers
-                        if !jmap.core.jmap.http_headers.is_empty() {
-                            let headers = response.headers_mut();
+                                for (pos, ch) in rest.char_indices() {
+                                    match ch {
+                                        '0'..='9' | 'a'..='f' | ':' | '.' => {
+                                            if start_ip == usize::MAX {
+                                                start_ip = pos;
+                                            }
+                                            end_ip = pos;
+                                        }
+                                        '"' | '[' | ' ' if start_ip == usize::MAX => {}
+                                        _ => {
+                                            break;
+                                        }
+                                    }
+                                }
 
-                            for (header, value) in &jmap.core.jmap.http_headers {
-                                headers.insert(header.clone(), value.clone());
-                            }
+                                rest.get(start_ip..=end_ip)
+                                    .and_then(|h| h.parse::<IpAddr>().ok())
+                            })
+                        })
+                        .or_else(|| {
+                            req.headers()
+                                .get("X-Forwarded-For")
+                                .and_then(|h| h.to_str().ok())
+                                .map(|h| h.split_once(',').map_or(h, |(ip, _)| ip).trim())
+                                .and_then(|h| h.parse::<IpAddr>().ok())
+                        })
+                    {
+                        trc::event!(
+                            Http(trc::HttpEvent::RequestUrl),
+                            SpanId = session.session_id,
+                            RemoteIp = forwarded_for,
+                            Url = req.uri().to_string(),
+                        );
+
+                        forwarded_for
+                    } else {
+                        trc::event!(
+                            Http(trc::HttpEvent::XForwardedMissing),
+                            SpanId = session.session_id,
+                        );
+                        session.remote_ip
+                    };
+
+                    // Parse HTTP request
+                    let response = match server
+                        .parse_http_request(
+                            req,
+                            HttpSessionData {
+                                instance,
+                                local_ip: session.local_ip,
+                                local_port: session.local_port,
+                                remote_ip,
+                                remote_port: session.remote_port,
+                                is_tls,
+                                session_id: session.session_id,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => {
+                            let response = err.into_http_response();
+                            trc::error!(err.span_id(session.session_id));
+                            response
                         }
+                    };
 
-                        Ok::<_, hyper::Error>(response)
+                    trc::event!(
+                        Http(trc::HttpEvent::ResponseBody),
+                        SpanId = session.session_id,
+                        Contents = match &response.body {
+                            HttpResponseBody::Text(value) => trc::Value::String(value.clone()),
+                            HttpResponseBody::Binary(_) => trc::Value::Static("[binary data]"),
+                            HttpResponseBody::Stream(_) => trc::Value::Static("[stream]"),
+                            _ => trc::Value::None,
+                        },
+                        Code = response.status.as_u16(),
+                        Size = response.size(),
+                    );
+
+                    // Build response
+                    let mut response = response.build();
+
+                    // Add custom headers
+                    if !server.core.jmap.http_headers.is_empty() {
+                        let headers = response.headers_mut();
+
+                        for (header, value) in &server.core.jmap.http_headers {
+                            headers.insert(header.clone(), value.clone());
+                        }
                     }
-                }),
-            )
-            .with_upgrades()
+
+                    Ok::<_, hyper::Error>(response)
+                }
+            }),
+        )
+        .with_upgrades()
+        .await
+    {
+        match inner
+            .build_server()
+            .is_scanner_fail2banned(session.remote_ip)
             .await
         {
-            trc::event!(
-                Http(trc::HttpEvent::Error),
-                SpanId = session.session_id,
-                Reason = http_err.to_string(),
-            );
+            Ok(true) => {
+                trc::event!(
+                    Security(SecurityEvent::ScanBan),
+                    SpanId = session.session_id,
+                    RemoteIp = session.remote_ip,
+                    Reason = http_err.to_string(),
+                );
+            }
+            Ok(false) => {
+                trc::event!(
+                    Http(trc::HttpEvent::Error),
+                    SpanId = session.session_id,
+                    Reason = http_err.to_string(),
+                );
+            }
+            Err(err) => {
+                trc::error!(err
+                    .span_id(session.session_id)
+                    .details("Failed to check for fail2ban"));
+            }
         }
     }
 }
 
 impl SessionManager for JmapSessionManager {
-    fn handle<T: SessionStream>(
-        self,
-        session: SessionData<T>,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        self.inner.handle_session(session)
+    fn handle<T: SessionStream>(self, session: SessionData<T>) -> impl Future<Output = ()> + Send {
+        handle_session(self.inner, session)
     }
 
     #[allow(clippy::manual_async_fn)]
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
         async {
-            let _ = self
-                .inner
-                .jmap_inner
-                .state_tx
-                .send(state::Event::Stop)
-                .await;
+            let _ = self.inner.ipc.state_tx.send(StateEvent::Stop).await;
         }
     }
 }
 
-struct HttpContext<'x> {
-    session: &'x HttpSessionData,
-    req: &'x HttpRequest,
+pub struct HttpContext<'x> {
+    pub session: &'x HttpSessionData,
+    pub req: &'x HttpRequest,
 }
 
 impl<'x> HttpContext<'x> {
-    fn new(session: &'x HttpSessionData, req: &'x HttpRequest) -> Self {
+    pub fn new(session: &'x HttpSessionData, req: &'x HttpRequest) -> Self {
         Self { session, req }
     }
 
-    pub async fn resolve_response_url(&self, core: &Core) -> String {
-        core.eval_if(
-            &core.network.http_response_url,
-            self,
-            self.session.session_id,
-        )
-        .await
-        .unwrap_or_else(|| {
-            format!(
-                "http{}://{}:{}",
-                if self.session.is_tls { "s" } else { "" },
-                self.session.local_ip,
-                self.session.local_port
+    pub async fn resolve_response_url(&self, server: &Server) -> String {
+        server
+            .eval_if(
+                &server.core.network.http_response_url,
+                self,
+                self.session.session_id,
             )
-        })
+            .await
+            .unwrap_or_else(|| {
+                format!(
+                    "http{}://{}:{}",
+                    if self.session.is_tls { "s" } else { "" },
+                    self.session.local_ip,
+                    self.session.local_port
+                )
+            })
     }
 
-    pub async fn has_endpoint_access(&self, core: &Core) -> StatusCode {
-        core.eval_if(
-            &core.network.http_allowed_endpoint,
-            self,
-            self.session.session_id,
-        )
-        .await
-        .unwrap_or(StatusCode::OK)
+    pub async fn has_endpoint_access(&self, server: &Server) -> StatusCode {
+        server
+            .eval_if(
+                &server.core.network.http_allowed_endpoint,
+                self,
+                self.session.session_id,
+            )
+            .await
+            .unwrap_or(StatusCode::OK)
     }
 }
 
@@ -802,11 +922,18 @@ impl HttpResponse {
 
 impl<T: serde::Serialize> ToHttpResponse for JsonResponse<T> {
     fn into_http_response(self) -> HttpResponse {
-        HttpResponse::new_text(
-            self.status,
-            "application/json; charset=utf-8",
-            serde_json::to_string(&self.inner).unwrap_or_default(),
-        )
+        HttpResponse {
+            status: self.status,
+            content_type: "application/json; charset=utf-8".into(),
+            content_disposition: "".into(),
+            cache_control: if !self.no_cache {
+                ""
+            } else {
+                "no-store, no-cache, must-revalidate"
+            }
+            .into(),
+            body: HttpResponseBody::Text(serde_json::to_string(&self.inner).unwrap_or_default()),
+        }
     }
 }
 
@@ -814,11 +941,6 @@ impl ToHttpResponse for &trc::Error {
     fn into_http_response(self) -> HttpResponse {
         match self.as_ref() {
             trc::EventType::Manage(cause) => {
-                let details_or_reason = self
-                    .value(trc::Key::Details)
-                    .or_else(|| self.value(trc::Key::Reason))
-                    .and_then(|v| v.as_str());
-
                 match cause {
                     trc::ManageEvent::MissingParameter => ManagementApiError::FieldMissing {
                         field: self.value_as_str(trc::Key::Key).unwrap_or_default(),
@@ -831,11 +953,18 @@ impl ToHttpResponse for &trc::Error {
                         item: self.value_as_str(trc::Key::Key).unwrap_or_default(),
                     },
                     trc::ManageEvent::NotSupported => ManagementApiError::Unsupported {
-                        details: details_or_reason.unwrap_or("Requested action is unsupported"),
+                        details: self
+                            .value(trc::Key::Details)
+                            .or_else(|| self.value(trc::Key::Reason))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Requested action is unsupported"),
                     },
                     trc::ManageEvent::AssertFailed => ManagementApiError::AssertFailed,
                     trc::ManageEvent::Error => ManagementApiError::Other {
-                        details: details_or_reason.unwrap_or("An error occurred."),
+                        reason: self.value_as_str(trc::Key::Reason),
+                        details: self
+                            .value_as_str(trc::Key::Details)
+                            .unwrap_or("Unknown error"),
                     },
                 }
             }
@@ -876,6 +1005,7 @@ impl ToRequestError for trc::Error {
                     RequestError::limit(RequestLimitError::ConcurrentUpload)
                 }
                 trc::LimitEvent::Quota => RequestError::over_quota(),
+                trc::LimitEvent::TenantQuota => RequestError::tenant_over_quota(),
                 trc::LimitEvent::BlobQuota => RequestError::over_blob_quota(
                     self.value(trc::Key::Total)
                         .and_then(|v| v.to_uint())
@@ -888,12 +1018,19 @@ impl ToRequestError for trc::Error {
             },
             trc::EventType::Auth(cause) => match cause {
                 trc::AuthEvent::MissingTotp => {
-                    RequestError::blank(403, "TOTP code required", cause.message())
+                    RequestError::blank(402, "TOTP code required", cause.message())
                 }
                 trc::AuthEvent::TooManyAttempts => RequestError::too_many_auth_attempts(),
                 _ => RequestError::unauthorized(),
             },
-            trc::EventType::Security(_) => RequestError::too_many_auth_attempts(),
+            trc::EventType::Security(cause) => match cause {
+                trc::SecurityEvent::AuthenticationBan
+                | trc::SecurityEvent::ScanBan
+                | trc::SecurityEvent::AbuseBan
+                | trc::SecurityEvent::LoiterBan
+                | trc::SecurityEvent::IpBlocked => RequestError::too_many_auth_attempts(),
+                trc::SecurityEvent::Unauthorized => RequestError::forbidden(),
+            },
             trc::EventType::Resource(cause) => match cause {
                 trc::ResourceEvent::NotFound => RequestError::not_found(),
                 trc::ResourceEvent::BadParameters => RequestError::blank(
@@ -914,11 +1051,21 @@ impl<T: serde::Serialize> JsonResponse<T> {
         JsonResponse {
             inner,
             status: StatusCode::OK,
+            no_cache: false,
         }
     }
 
     pub fn with_status(status: StatusCode, inner: T) -> Self {
-        JsonResponse { inner, status }
+        JsonResponse {
+            inner,
+            status,
+            no_cache: false,
+        }
+    }
+
+    pub fn no_cache(mut self) -> Self {
+        self.no_cache = true;
+        self
     }
 }
 

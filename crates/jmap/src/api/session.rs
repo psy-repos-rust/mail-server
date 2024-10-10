@@ -6,17 +6,27 @@
 
 use std::sync::Arc;
 
-use directory::QueryBy;
+use common::{auth::AccessToken, Server};
+use directory::{backend::internal::PrincipalField, QueryBy};
 use jmap_proto::{
     request::capability::{Capability, Session},
     types::{acl::Acl, collection::Collection, id::Id},
 };
+use std::future::Future;
 use trc::AddContext;
 
-use crate::{auth::AccessToken, JMAP};
+use crate::auth::acl::AclMethods;
 
-impl JMAP {
-    pub async fn handle_session_resource(
+pub trait SessionHandler: Sync + Send {
+    fn handle_session_resource(
+        &self,
+        base_url: String,
+        access_token: Arc<AccessToken>,
+    ) -> impl Future<Output = trc::Result<Session>> + Send;
+}
+
+impl SessionHandler for Server {
+    async fn handle_session_resource(
         &self,
         base_url: String,
         access_token: Arc<AccessToken>,
@@ -52,7 +62,7 @@ impl JMAP {
                     .query(QueryBy::Id(*id), false)
                     .await
                     .caused_by(trc::location!())?
-                    .map(|p| p.name)
+                    .and_then(|mut p| p.take_str(PrincipalField::Name))
                     .unwrap_or_else(|| Id::from(*id).to_string()),
                 is_personal,
                 is_readonly,

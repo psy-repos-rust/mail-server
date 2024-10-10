@@ -6,9 +6,11 @@
 
 use std::{net::IpAddr, sync::Arc};
 
-use common::listener::{limiter::InFlight, ServerInstance, SessionStream};
-use imap::core::{ImapInstance, Inner};
-use jmap::JMAP;
+use common::{
+    auth::AccessToken,
+    listener::{limiter::InFlight, ServerInstance, SessionStream},
+    Inner, Server,
+};
 use mailbox::Mailbox;
 use protocol::request::Parser;
 
@@ -22,18 +24,17 @@ static SERVER_GREETING: &str = "+OK Stalwart POP3 at your service.\r\n";
 
 #[derive(Clone)]
 pub struct Pop3SessionManager {
-    pub pop3: ImapInstance,
+    pub inner: Arc<Inner>,
 }
 
 impl Pop3SessionManager {
-    pub fn new(pop3: ImapInstance) -> Self {
-        Self { pop3 }
+    pub fn new(inner: Arc<Inner>) -> Self {
+        Self { inner }
     }
 }
 
 pub struct Session<T: SessionStream> {
-    pub jmap: JMAP,
-    pub imap: Arc<Inner>,
+    pub server: Server,
     pub instance: Arc<ServerInstance>,
     pub receiver: Parser,
     pub state: State,
@@ -51,6 +52,7 @@ pub enum State {
     Authenticated {
         mailbox: Mailbox,
         in_flight: Option<InFlight>,
+        access_token: Arc<AccessToken>,
     },
 }
 
@@ -65,6 +67,13 @@ impl State {
     pub fn mailbox_mut(&mut self) -> &mut Mailbox {
         match self {
             State::Authenticated { mailbox, .. } => mailbox,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn access_token(&self) -> &Arc<AccessToken> {
+        match self {
+            State::Authenticated { access_token, .. } => access_token,
             _ => unreachable!(),
         }
     }

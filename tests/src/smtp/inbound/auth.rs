@@ -9,12 +9,14 @@ use common::Core;
 use store::Stores;
 use utils::config::Config;
 
-use crate::smtp::{
-    build_smtp,
-    session::{TestSession, VerifyResponse},
-    TempDir,
+use crate::{
+    smtp::{
+        session::{TestSession, VerifyResponse},
+        TempDir, TestSMTP,
+    },
+    AssertConfig,
 };
-use smtp::core::{Inner, Session, State};
+use smtp::core::{Session, State};
 
 const CONFIG: &str = r#"
 [storage]
@@ -22,6 +24,7 @@ data = "sqlite"
 lookup = "sqlite"
 blob = "sqlite"
 fts = "sqlite"
+directory = "local"
 
 [store."sqlite"]
 type = "sqlite"
@@ -74,9 +77,10 @@ async fn auth() {
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
     let stores = Stores::parse_all(&mut config).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
     // EHLO should not advertise plain text auth without TLS
-    let mut session = Session::test(build_smtp(core, Inner::default()));
+    let mut session = Session::test(TestSMTP::from_core(core).server);
     session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.stream.tls = false;
@@ -138,7 +142,7 @@ async fn auth() {
         .assert_contains("FUTURERELEASE 86400");
 
     // Successful LOGIN authentication
-    session.data.authenticated_as.clear();
+    session.data.authenticated_as.take();
     session.cmd("AUTH LOGIN", "334").await;
     session.cmd("amFuZQ==", "334").await;
     session.cmd("cDRzc3cwcmQ=", "235 2.7.0").await;

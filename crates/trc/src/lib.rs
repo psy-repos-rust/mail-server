@@ -183,6 +183,7 @@ pub enum EventType {
     OutgoingReport(OutgoingReportEvent),
     Telemetry(TelemetryEvent),
     Security(SecurityEvent),
+    Ai(AiEvent),
 }
 
 #[event_type]
@@ -199,9 +200,11 @@ pub enum HttpEvent {
 #[event_type]
 pub enum SecurityEvent {
     AuthenticationBan,
-    BruteForceBan,
+    AbuseBan,
+    ScanBan,
     LoiterBan,
     IpBlocked,
+    Unauthorized,
 }
 
 #[event_type]
@@ -213,8 +216,7 @@ pub enum ClusterEvent {
     PeerSuspectedIsAlive,
     PeerBackOnline,
     PeerLeaving,
-    PeerHasConfigChanges,
-    PeerHasListChanges,
+    PeerHasChanges,
     OneOrMorePeersOffline,
     EmptyPacket,
     InvalidPacket,
@@ -905,6 +907,7 @@ pub enum LimitEvent {
     ConcurrentConnection, // Used by listener
     Quota,
     BlobQuota,
+    TenantQuota,
     TooManyRequests,
 }
 
@@ -922,8 +925,10 @@ pub enum ManageEvent {
 pub enum AuthEvent {
     Success,
     Failed,
+    TokenExpired,
     MissingTotp,
     TooManyAttempts,
+    ClientRegistration,
     Error,
 }
 
@@ -934,6 +939,12 @@ pub enum ResourceEvent {
     Error,
     DownloadExternal,
     WebadminUnpacked,
+}
+
+#[event_type]
+pub enum AiEvent {
+    LlmResponse,
+    ApiError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

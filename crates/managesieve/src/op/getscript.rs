@@ -6,19 +6,23 @@
 
 use std::time::Instant;
 
+use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::receiver::Request;
-use jmap::sieve::set::ObjectBlobId;
+use jmap::{blob::download::BlobDownload, sieve::set::ObjectBlobId, JmapMethods};
 use jmap_proto::{
     object::Object,
     types::{collection::Collection, property::Property, value::Value},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 use trc::AddContext;
 
 use crate::core::{Command, ResponseCode, Session, StatusResponse};
 
-impl<T: AsyncRead + AsyncWrite> Session<T> {
+impl<T: SessionStream> Session<T> {
     pub async fn handle_getscript(&mut self, request: Request<Command>) -> trc::Result<Vec<u8>> {
+        // Validate access
+        self.assert_has_permission(Permission::SieveGetScript)?;
+
         let op_start = Instant::now();
         let name = request
             .tokens
@@ -33,7 +37,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
         let account_id = self.state.access_token().primary_id();
         let document_id = self.get_script_id(account_id, &name).await?;
         let (blob_section, blob_hash) = self
-            .jmap
+            .server
             .get_property::<Object<Value>>(
                 account_id,
                 Collection::SieveScript,
@@ -57,7 +61,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
                     .code(ResponseCode::TryLater)
             })?;
         let script = self
-            .jmap
+            .server
             .get_blob_section(&blob_hash, &blob_section)
             .await
             .caused_by(trc::location!())?

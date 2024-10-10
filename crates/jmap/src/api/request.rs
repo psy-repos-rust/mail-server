@@ -6,6 +6,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
     method::{
         get, query,
@@ -17,12 +18,51 @@ use jmap_proto::{
 };
 use trc::JmapEvent;
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{
+    blob::{copy::BlobCopy, get::BlobOperations, upload::BlobUpload},
+    changes::{get::ChangesLookup, query::QueryChanges},
+    email::{
+        copy::EmailCopy, get::EmailGet, import::EmailImport, parse::EmailParse, query::EmailQuery,
+        set::EmailSet, snippet::EmailSearchSnippet,
+    },
+    identity::{get::IdentityGet, set::IdentitySet},
+    mailbox::{get::MailboxGet, query::MailboxQuery, set::MailboxSet},
+    principal::{get::PrincipalGet, query::PrincipalQuery},
+    push::{get::PushSubscriptionFetch, set::PushSubscriptionSet},
+    quota::{get::QuotaGet, query::QuotaQuery},
+    services::state::StateManager,
+    sieve::{
+        get::SieveScriptGet, query::SieveScriptQuery, set::SieveScriptSet,
+        validate::SieveScriptValidate,
+    },
+    submission::{get::EmailSubmissionGet, query::EmailSubmissionQuery, set::EmailSubmissionSet},
+    thread::get::ThreadGet,
+    vacation::{get::VacationResponseGet, set::VacationResponseSet},
+};
 
 use super::http::HttpSessionData;
+use std::future::Future;
 
-impl JMAP {
-    pub async fn handle_request(
+pub trait RequestHandler: Sync + Send {
+    fn handle_request(
+        &self,
+        request: Request,
+        access_token: Arc<AccessToken>,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = Response> + Send;
+
+    fn handle_method_call(
+        &self,
+        method: RequestMethod,
+        method_name: &'static str,
+        access_token: &AccessToken,
+        next_call: &mut Option<Call<RequestMethod>>,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<ResponseMethod>> + Send;
+}
+
+impl RequestHandler for Server {
+    async fn handle_request(
         &self,
         request: Request,
         access_token: Arc<AccessToken>,
@@ -135,6 +175,11 @@ impl JMAP {
         session: &HttpSessionData,
     ) -> trc::Result<ResponseMethod> {
         let op_start = Instant::now();
+
+        // Check permissions
+        access_token.assert_has_jmap_permission(&method)?;
+
+        // Handle method
         let response = match method {
             RequestMethod::Get(mut req) => match req.take_arguments() {
                 get::RequestArguments::Email(arguments) => {
@@ -177,15 +222,7 @@ impl JMAP {
 
                     self.vacation_response_get(req).await?.into()
                 }
-                get::RequestArguments::Principal => {
-                    if self.core.jmap.principal_allow_lookups || access_token.is_super_user() {
-                        self.principal_get(req).await?.into()
-                    } else {
-                        return Err(trc::JmapEvent::Forbidden
-                            .into_err()
-                            .details("Principal lookups are disabled".to_string()));
-                    }
-                }
+                get::RequestArguments::Principal => self.principal_get(req).await?.into(),
                 get::RequestArguments::Quota => {
                     access_token.assert_is_member(req.account_id)?;
 
@@ -225,13 +262,7 @@ impl JMAP {
                     self.sieve_script_query(req).await?.into()
                 }
                 query::RequestArguments::Principal => {
-                    if self.core.jmap.principal_allow_lookups || access_token.is_super_user() {
-                        self.principal_query(req, session).await?.into()
-                    } else {
-                        return Err(trc::JmapEvent::Forbidden
-                            .into_err()
-                            .details("Principal lookups are disabled".to_string()));
-                    }
+                    self.principal_query(req, session).await?.into()
                 }
                 query::RequestArguments::Quota => {
                     access_token.assert_is_member(req.account_id)?;
@@ -281,7 +312,7 @@ impl JMAP {
                 set::RequestArguments::VacationResponse => {
                     access_token.assert_is_member(req.account_id)?;
 
-                    self.vacation_response_set(req).await?.into()
+                    self.vacation_response_set(req, access_token).await?.into()
                 }
             },
             RequestMethod::Changes(req) => self.changes(req, access_token).await?.into(),

@@ -6,10 +6,10 @@
 
 use common::listener::{SessionResult, SessionStream};
 use mail_send::Credentials;
-use trc::AddContext;
+use trc::{AddContext, SecurityEvent};
 
 use crate::{
-    protocol::{request::Error, response::Response, Command, Mechanism},
+    protocol::{request::Error, Command, Mechanism},
     Session, State,
 };
 
@@ -49,6 +49,27 @@ impl<T: SessionStream> Session<T> {
                     break;
                 }
                 Err(Error::Parse(err)) => {
+                    // Check for port scanners
+                    if matches!(&self.state, State::NotAuthenticated { .. },) {
+                        match self.server.is_scanner_fail2banned(self.remote_addr).await {
+                            Ok(true) => {
+                                trc::event!(
+                                    Security(SecurityEvent::ScanBan),
+                                    SpanId = self.session_id,
+                                    RemoteIp = self.remote_addr,
+                                    Reason = "Invalid POP3 command",
+                                );
+
+                                return SessionResult::Close;
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                trc::error!(err
+                                    .span_id(self.session_id)
+                                    .details("Failed to check for fail2ban"));
+                            }
+                        }
+                    }
                     requests.push(Err(trc::Pop3Event::Error.into_err().details(err)));
                 }
             }
@@ -117,54 +138,11 @@ impl<T: SessionStream> Session<T> {
                             self.write_ok("NOOP").await.map(|_| SessionResult::Continue)
                         }
                         Command::Rset => self.handle_rset().await.map(|_| SessionResult::Continue),
-                        Command::Capa => {
-                            let mechanisms =
-                                if self.stream.is_tls() || self.jmap.core.imap.allow_plain_auth {
-                                    vec![Mechanism::Plain, Mechanism::OAuthBearer]
-                                } else {
-                                    vec![Mechanism::OAuthBearer]
-                                };
-
-                            trc::event!(
-                                Pop3(trc::Pop3Event::Capabilities),
-                                SpanId = self.session_id,
-                                Tls = self.stream.is_tls(),
-                                Strict = !self.jmap.core.imap.allow_plain_auth,
-                                Elapsed = trc::Value::Duration(0)
-                            );
-
-                            self.write_bytes(
-                                Response::Capability::<u32> {
-                                    mechanisms,
-                                    stls: !self.stream.is_tls(),
-                                }
-                                .serialize(),
-                            )
-                            .await
-                            .map(|_| SessionResult::Continue)
-                        }
+                        Command::Capa => self.handle_capa().await.map(|_| SessionResult::Continue),
                         Command::Stls => {
-                            trc::event!(
-                                Pop3(trc::Pop3Event::StartTls),
-                                SpanId = self.session_id,
-                                Elapsed = trc::Value::Duration(0)
-                            );
-
-                            self.write_ok("Begin TLS negotiation now")
-                                .await
-                                .map(|_| SessionResult::UpgradeTls)
+                            self.handle_stls().await.map(|_| SessionResult::UpgradeTls)
                         }
-                        Command::Utf8 => {
-                            trc::event!(
-                                Pop3(trc::Pop3Event::Utf8),
-                                SpanId = self.session_id,
-                                Elapsed = trc::Value::Duration(0)
-                            );
-
-                            self.write_ok("UTF8 enabled")
-                                .await
-                                .map(|_| SessionResult::Continue)
-                        }
+                        Command::Utf8 => self.handle_utf8().await.map(|_| SessionResult::Continue),
                         Command::Auth { mechanism, params } => self
                             .handle_sasl(mechanism, params)
                             .await
@@ -206,7 +184,7 @@ impl<T: SessionStream> Session<T> {
             | Command::Pass { .. }
             | Command::Apop { .. } => {
                 if let State::NotAuthenticated { username, .. } = &self.state {
-                    if self.stream.is_tls() || self.jmap.core.imap.allow_plain_auth {
+                    if self.stream.is_tls() || self.server.core.imap.allow_plain_auth {
                         if !matches!(command, Command::Pass { .. }) || username.is_some() {
                             Ok(command)
                         } else {
@@ -254,9 +232,9 @@ impl<T: SessionStream> Session<T> {
             | Command::Stat
             | Command::Rset => {
                 if let State::Authenticated { mailbox, .. } = &self.state {
-                    if let Some(rate) = &self.jmap.core.imap.rate_requests {
+                    if let Some(rate) = &self.server.core.imap.rate_requests {
                         if self
-                            .jmap
+                            .server
                             .core
                             .storage
                             .lookup

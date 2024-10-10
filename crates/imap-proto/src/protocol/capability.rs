@@ -34,6 +34,7 @@ pub enum Capability {
     Sort,
     Thread,       //THREAD=REFERENCES
     ListExtended, //LIST-EXTENDED
+    ListStatus,   //LIST-STATUS
     ESort,
     SortDisplay,      //SORT=DISPLAY
     SpecialUse,       //SPECIAL-USE
@@ -86,6 +87,7 @@ impl Capability {
             Capability::Sort => b"SORT",
             Capability::Thread => b"THREAD=REFERENCES",
             Capability::ListExtended => b"LIST-EXTENDED",
+            Capability::ListStatus => b"LIST-STATUS",
             Capability::ESort => b"ESORT",
             Capability::SortDisplay => b"SORT=DISPLAY",
             Capability::SpecialUse => b"SPECIAL-USE",
@@ -95,7 +97,7 @@ impl Capability {
         });
     }
 
-    pub fn all_capabilities(is_authenticated: bool, is_tls: bool) -> Vec<Capability> {
+    pub fn all_capabilities(is_authenticated: bool, offer_tls: bool) -> Vec<Capability> {
         let mut capabilities = vec![
             Capability::IMAP4rev2,
             Capability::IMAP4rev1,
@@ -122,6 +124,7 @@ impl Capability {
                 Capability::Sort,
                 Capability::Thread,
                 Capability::ListExtended,
+                Capability::ListStatus,
                 Capability::ESort,
                 Capability::SortDisplay,
                 Capability::SpecialUse,
@@ -140,7 +143,7 @@ impl Capability {
                 Capability::Auth(Mechanism::Plain),
             ]);
         }
-        if !is_tls {
+        if offer_tls {
             capabilities.push(Capability::StartTLS);
         }
 

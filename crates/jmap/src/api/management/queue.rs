@@ -4,7 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use std::future::Future;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use common::{auth::AccessToken, ipc::QueueEvent, Server};
+use directory::{
+    backend::internal::{manage::ManageDirectory, PrincipalField},
+    Permission, Type,
+};
 use hyper::Method;
 use mail_auth::{
     dmarc::URI,
@@ -14,17 +21,18 @@ use mail_auth::{
 use mail_parser::DateTime;
 use serde::{Deserializer, Serializer};
 use serde_json::json;
-use smtp::queue::{self, ErrorDetails, HostResponse, QueueId, Status};
+use smtp::{
+    queue::{self, spool::SmtpSpool, ErrorDetails, HostResponse, QueueId, Status},
+    reporting::{dmarc::DmarcReporting, tls::TlsReporting},
+};
 use store::{
     write::{key::DeserializeBigEndian, now, Bincode, QueueClass, ReportEvent, ValueClass},
     Deserialize, IterateParams, ValueKey,
 };
+use trc::AddContext;
 use utils::url_params::UrlParams;
 
-use crate::{
-    api::{http::ToHttpResponse, HttpRequest, HttpResponse, JsonResponse},
-    JMAP,
-};
+use crate::api::{http::ToHttpResponse, HttpRequest, HttpResponse, JsonResponse};
 
 use super::{decode_path_element, FutureTimestamp};
 
@@ -100,13 +108,59 @@ pub enum Report {
     },
 }
 
-impl JMAP {
-    pub async fn handle_manage_queue(
+pub trait QueueManagement: Sync + Send {
+    fn handle_manage_queue(
         &self,
         req: &HttpRequest,
         path: Vec<&str>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl QueueManagement for Server {
+    async fn handle_manage_queue(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+        access_token: &AccessToken,
     ) -> trc::Result<HttpResponse> {
         let params = UrlParams::new(req.uri().query());
+
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+
+        // Limit to tenant domains
+        let mut tenant_domains: Option<Vec<String>> = None;
+        #[cfg(feature = "enterprise")]
+        if self.core.is_enterprise_edition() {
+            if let Some(tenant) = access_token.tenant {
+                tenant_domains = self
+                    .core
+                    .storage
+                    .data
+                    .list_principals(
+                        None,
+                        tenant.id.into(),
+                        &[Type::Domain],
+                        &[PrincipalField::Name],
+                        0,
+                        0,
+                    )
+                    .await
+                    .map(|principals| {
+                        principals
+                            .items
+                            .into_iter()
+                            .filter_map(|mut p| p.take_str(PrincipalField::Name))
+                            .collect::<Vec<_>>()
+                    })
+                    .caused_by(trc::location!())?
+                    .into();
+            }
+        }
+
+        // SPDX-SnippetEnd
 
         match (
             path.get(1).copied().unwrap_or_default(),
@@ -114,6 +168,9 @@ impl JMAP {
             req.method(),
         ) {
             ("messages", None, &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MessageQueueList)?;
+
                 let text = params.get("text");
                 let from = params.get("from");
                 let to = params.get("to");
@@ -150,32 +207,35 @@ impl JMAP {
                         IterateParams::new(from_key, to_key).ascending(),
                         |key, value| {
                             let message = Bincode::<queue::Message>::deserialize(value)?.inner;
-                            let matches = !has_filters
-                                || (text
-                                    .as_ref()
-                                    .map(|text| {
-                                        message.return_path.contains(text)
-                                            || message
-                                                .recipients
-                                                .iter()
-                                                .any(|r| r.address_lcase.contains(text))
-                                    })
-                                    .unwrap_or_else(|| {
-                                        from.as_ref()
-                                            .map_or(true, |from| message.return_path.contains(from))
-                                            && to.as_ref().map_or(true, |to| {
+                            let matches = tenant_domains
+                                .as_ref()
+                                .map_or(true, |domains| message.has_domain(domains))
+                                && (!has_filters
+                                    || (text
+                                        .as_ref()
+                                        .map(|text| {
+                                            message.return_path.contains(text)
+                                                || message
+                                                    .recipients
+                                                    .iter()
+                                                    .any(|r| r.address_lcase.contains(text))
+                                        })
+                                        .unwrap_or_else(|| {
+                                            from.as_ref().map_or(true, |from| {
+                                                message.return_path.contains(from)
+                                            }) && to.as_ref().map_or(true, |to| {
                                                 message
                                                     .recipients
                                                     .iter()
                                                     .any(|r| r.address_lcase.contains(to))
                                             })
-                                    })
-                                    && before.as_ref().map_or(true, |before| {
-                                        message.next_delivery_event() < *before
-                                    })
-                                    && after.as_ref().map_or(true, |after| {
-                                        message.next_delivery_event() > *after
-                                    }));
+                                        })
+                                        && before.as_ref().map_or(true, |before| {
+                                            message.next_delivery_event() < *before
+                                        })
+                                        && after.as_ref().map_or(true, |after| {
+                                            message.next_delivery_event() > *after
+                                        })));
 
                             if matches {
                                 if offset == 0 {
@@ -217,10 +277,17 @@ impl JMAP {
                 .into_http_response())
             }
             ("messages", Some(queue_id), &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MessageQueueGet)?;
+
                 if let Some(message) = self
-                    .smtp
                     .read_message(queue_id.parse().unwrap_or_default())
                     .await
+                    .filter(|message| {
+                        tenant_domains
+                            .as_ref()
+                            .map_or(true, |domains| message.has_domain(domains))
+                    })
                 {
                     Ok(JsonResponse::new(json!({
                             "data": Message::from(&message),
@@ -231,6 +298,9 @@ impl JMAP {
                 }
             }
             ("messages", Some(queue_id), &Method::PATCH) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MessageQueueUpdate)?;
+
                 let time = params
                     .parse::<FutureTimestamp>("at")
                     .map(|t| t.into_inner())
@@ -238,9 +308,13 @@ impl JMAP {
                 let item = params.get("filter");
 
                 if let Some(mut message) = self
-                    .smtp
                     .read_message(queue_id.parse().unwrap_or_default())
                     .await
+                    .filter(|message| {
+                        tenant_domains
+                            .as_ref()
+                            .map_or(true, |domains| message.has_domain(domains))
+                    })
                 {
                     let prev_event = message.next_event().unwrap_or_default();
                     let mut found = false;
@@ -264,9 +338,9 @@ impl JMAP {
                     if found {
                         let next_event = message.next_event().unwrap_or_default();
                         message
-                            .save_changes(&self.smtp, prev_event.into(), next_event.into())
+                            .save_changes(self, prev_event.into(), next_event.into())
                             .await;
-                        let _ = self.smtp.inner.queue_tx.send(queue::Event::Reload).await;
+                        let _ = self.inner.ipc.queue_tx.send(QueueEvent::Reload).await;
                     }
 
                     Ok(JsonResponse::new(json!({
@@ -278,10 +352,17 @@ impl JMAP {
                 }
             }
             ("messages", Some(queue_id), &Method::DELETE) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MessageQueueDelete)?;
+
                 if let Some(mut message) = self
-                    .smtp
                     .read_message(queue_id.parse().unwrap_or_default())
                     .await
+                    .filter(|message| {
+                        tenant_domains
+                            .as_ref()
+                            .map_or(true, |domains| message.has_domain(domains))
+                    })
                 {
                     let mut found = false;
                     let prev_event = message.next_event().unwrap_or_default();
@@ -338,14 +419,14 @@ impl JMAP {
                             }) {
                                 let next_event = message.next_event().unwrap_or_default();
                                 message
-                                    .save_changes(&self.smtp, next_event.into(), prev_event.into())
+                                    .save_changes(self, next_event.into(), prev_event.into())
                                     .await;
                             } else {
-                                message.remove(&self.smtp, prev_event).await;
+                                message.remove(self, prev_event).await;
                             }
                         }
                     } else {
-                        message.remove(&self.smtp, prev_event).await;
+                        message.remove(self, prev_event).await;
                         found = true;
                     }
 
@@ -358,6 +439,9 @@ impl JMAP {
                 }
             }
             ("reports", None, &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::OutgoingReportList)?;
+
                 let domain = params.get("domain").map(|d| d.to_lowercase());
                 let type_ = params.get("type").and_then(|t| match t {
                     "dmarc" => 0u8.into(),
@@ -399,7 +483,10 @@ impl JMAP {
                         |key, _| {
                             if type_.map_or(true, |t| t == *key.last().unwrap()) {
                                 let event = ReportEvent::deserialize(key)?;
-                                if event.seq_id != 0
+                                if tenant_domains
+                                    .as_ref()
+                                    .map_or(true, |domains| domains.contains(&event.domain))
+                                    && event.seq_id != 0
                                     && domain.as_ref().map_or(true, |d| event.domain.contains(d))
                                 {
                                     if offset == 0 {
@@ -436,23 +523,32 @@ impl JMAP {
                 .into_http_response())
             }
             ("reports", Some(report_id), &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::OutgoingReportGet)?;
+
                 let mut result = None;
                 if let Some(report_id) = parse_queued_report_id(report_id.as_ref()) {
                     match report_id {
-                        QueueClass::DmarcReportHeader(event) => {
+                        QueueClass::DmarcReportHeader(event)
+                            if tenant_domains
+                                .as_ref()
+                                .map_or(true, |domains| domains.contains(&event.domain)) =>
+                        {
                             let mut rua = Vec::new();
                             if let Some(report) = self
-                                .smtp
                                 .generate_dmarc_aggregate_report(&event, &mut rua, None, 0)
                                 .await?
                             {
                                 result = Report::dmarc(event, report, rua).into();
                             }
                         }
-                        QueueClass::TlsReportHeader(event) => {
+                        QueueClass::TlsReportHeader(event)
+                            if tenant_domains
+                                .as_ref()
+                                .map_or(true, |domains| domains.contains(&event.domain)) =>
+                        {
                             let mut rua = Vec::new();
                             if let Some(report) = self
-                                .smtp
                                 .generate_tls_aggregate_report(&[event.clone()], &mut rua, None, 0)
                                 .await?
                             {
@@ -473,19 +569,32 @@ impl JMAP {
                 }
             }
             ("reports", Some(report_id), &Method::DELETE) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::OutgoingReportDelete)?;
+
                 if let Some(report_id) = parse_queued_report_id(report_id.as_ref()) {
-                    match report_id {
-                        QueueClass::DmarcReportHeader(event) => {
-                            self.smtp.delete_dmarc_report(event).await;
+                    let result = match report_id {
+                        QueueClass::DmarcReportHeader(event)
+                            if tenant_domains
+                                .as_ref()
+                                .map_or(true, |domains| domains.contains(&event.domain)) =>
+                        {
+                            self.delete_dmarc_report(event).await;
+                            true
                         }
-                        QueueClass::TlsReportHeader(event) => {
-                            self.smtp.delete_tls_report(vec![event]).await;
+                        QueueClass::TlsReportHeader(event)
+                            if tenant_domains
+                                .as_ref()
+                                .map_or(true, |domains| domains.contains(&event.domain)) =>
+                        {
+                            self.delete_tls_report(vec![event]).await;
+                            true
                         }
-                        _ => (),
-                    }
+                        _ => false,
+                    };
 
                     Ok(JsonResponse::new(json!({
-                            "data": true,
+                            "data": result,
                     }))
                     .into_http_response())
                 } else {

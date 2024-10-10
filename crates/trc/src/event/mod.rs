@@ -140,6 +140,12 @@ impl Event<EventType> {
         self.inner == EventType::Store(StoreEvent::AssertValueFailed)
     }
 
+    pub fn key(&self, key: Key) -> Option<&Value> {
+        self.keys
+            .iter()
+            .find_map(|(k, v)| if *k == key { Some(v) } else { None })
+    }
+
     #[inline(always)]
     pub fn is_jmap_method_error(&self) -> bool {
         !matches!(
@@ -261,6 +267,7 @@ impl EventType {
             EventType::Auth(cause) => cause.message(),
             EventType::Config(_) => "Configuration error",
             EventType::Resource(cause) => cause.message(),
+            EventType::Security(_) => "Insufficient permissions",
             _ => "Internal server error",
         }
     }
@@ -467,6 +474,7 @@ impl LimitEvent {
             Self::Quota => "Quota exceeded",
             Self::BlobQuota => "Blob quota exceeded",
             Self::TooManyRequests => "Too many requests",
+            Self::TenantQuota => "Tenant quota exceeded",
         }
     }
 }

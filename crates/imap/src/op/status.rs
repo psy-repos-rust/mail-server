@@ -7,17 +7,19 @@
 use std::{sync::Arc, time::Instant};
 
 use crate::{
-    core::{Mailbox, Session, SessionData},
+    core::{Session, SessionData},
     op::ImapContext,
     spawn_op,
 };
-use common::listener::SessionStream;
+use common::{listener::SessionStream, Mailbox};
+use directory::Permission;
 use imap_proto::{
     parser::PushUnique,
     protocol::status::{Status, StatusItem, StatusItemType},
     receiver::Request,
     Command, ResponseCode, StatusResponse,
 };
+use jmap::JmapMethods;
 use jmap_proto::{
     object::Object,
     types::{collection::Collection, id::Id, keyword::Keyword, property::Property, value::Value},
@@ -34,6 +36,9 @@ use super::ToModSeq;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_status(&mut self, request: Request<Command>) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapStatus)?;
+
         let op_start = Instant::now();
         let arguments = request.parse_status(self.version)?;
         let version = self.version;
@@ -82,11 +87,11 @@ impl<T: SessionStream> SessionData<T> {
             mailbox
         } else {
             // Some IMAP clients will try to get the status of a mailbox with the NoSelect flag
-            return if mailbox_name == self.jmap.core.jmap.shared_folder
+            return if mailbox_name == self.server.core.jmap.shared_folder
                 || mailbox_name
                     .split_once('/')
                     .map_or(false, |(base_name, path)| {
-                        base_name == self.jmap.core.jmap.shared_folder && !path.contains('/')
+                        base_name == self.server.core.jmap.shared_folder && !path.contains('/')
                     })
             {
                 Ok(StatusItem {
@@ -207,7 +212,7 @@ impl<T: SessionStream> SessionData<T> {
             // Retrieve latest values
             let mut values_update = Vec::with_capacity(items_update.len());
             let mailbox_message_ids = self
-                .jmap
+                .server
                 .get_tag(
                     mailbox.account_id,
                     Collection::Email,
@@ -218,7 +223,7 @@ impl<T: SessionStream> SessionData<T> {
                 .caused_by(trc::location!())?
                 .map(Arc::new);
             let message_ids = self
-                .jmap
+                .server
                 .get_document_ids(mailbox.account_id, Collection::Email)
                 .await
                 .caused_by(trc::location!())?;
@@ -228,7 +233,7 @@ impl<T: SessionStream> SessionData<T> {
                     Status::Messages => mailbox_message_ids.as_ref().map(|v| v.len()).unwrap_or(0),
                     Status::UidNext => {
                         (self
-                            .jmap
+                            .server
                             .core
                             .storage
                             .data
@@ -243,7 +248,7 @@ impl<T: SessionStream> SessionData<T> {
                             + 1) as u64
                     }
                     Status::UidValidity => self
-                        .jmap
+                        .server
                         .get_property::<Object<Value>>(
                             mailbox.account_id,
                             Collection::Mailbox,
@@ -266,7 +271,7 @@ impl<T: SessionStream> SessionData<T> {
                             (&message_ids, &mailbox_message_ids)
                         {
                             if let Some(mut seen) = self
-                                .jmap
+                                .server
                                 .get_tag(
                                     mailbox.account_id,
                                     Collection::Email,
@@ -289,7 +294,7 @@ impl<T: SessionStream> SessionData<T> {
                     Status::Deleted => {
                         if let (Some(mailbox_message_ids), Some(mut deleted)) = (
                             &mailbox_message_ids,
-                            self.jmap
+                            self.server
                                 .get_tag(
                                     mailbox.account_id,
                                     Collection::Email,
@@ -374,7 +379,7 @@ impl<T: SessionStream> SessionData<T> {
         message_ids: &Arc<RoaringBitmap>,
     ) -> trc::Result<u32> {
         let mut total_size = 0u32;
-        self.jmap
+        self.server
             .core
             .storage
             .data

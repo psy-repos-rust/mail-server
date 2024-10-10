@@ -44,7 +44,7 @@ impl EventType {
             },
             EventType::Jmap(_) => Level::Debug,
             EventType::Imap(event) => match event {
-                ImapEvent::ConnectionStart | ImapEvent::ConnectionEnd => Level::Info,
+                ImapEvent::ConnectionStart | ImapEvent::ConnectionEnd => Level::Debug,
                 ImapEvent::GetAcl
                 | ImapEvent::SetAcl
                 | ImapEvent::MyRights
@@ -80,7 +80,7 @@ impl EventType {
                 ImapEvent::RawInput | ImapEvent::RawOutput => Level::Trace,
             },
             EventType::ManageSieve(event) => match event {
-                ManageSieveEvent::ConnectionStart | ManageSieveEvent::ConnectionEnd => Level::Info,
+                ManageSieveEvent::ConnectionStart | ManageSieveEvent::ConnectionEnd => Level::Debug,
                 ManageSieveEvent::CreateScript
                 | ManageSieveEvent::UpdateScript
                 | ManageSieveEvent::GetScript
@@ -99,7 +99,7 @@ impl EventType {
                 ManageSieveEvent::RawInput | ManageSieveEvent::RawOutput => Level::Trace,
             },
             EventType::Pop3(event) => match event {
-                Pop3Event::ConnectionStart | Pop3Event::ConnectionEnd => Level::Info,
+                Pop3Event::ConnectionStart | Pop3Event::ConnectionEnd => Level::Debug,
                 Pop3Event::Delete
                 | Pop3Event::Reset
                 | Pop3Event::Quit
@@ -117,7 +117,7 @@ impl EventType {
                 Pop3Event::RawInput | Pop3Event::RawOutput => Level::Trace,
             },
             EventType::Smtp(event) => match event {
-                SmtpEvent::ConnectionStart | SmtpEvent::ConnectionEnd => Level::Info,
+                SmtpEvent::ConnectionStart | SmtpEvent::ConnectionEnd => Level::Debug,
                 SmtpEvent::DidNotSayEhlo
                 | SmtpEvent::EhloExpected
                 | SmtpEvent::LhloExpected
@@ -221,14 +221,15 @@ impl EventType {
                 LimitEvent::Quota => Level::Debug,
                 LimitEvent::BlobQuota => Level::Debug,
                 LimitEvent::TooManyRequests => Level::Warn,
+                LimitEvent::TenantQuota => Level::Info,
             },
             EventType::Manage(_) => Level::Debug,
             EventType::Auth(cause) => match cause {
-                AuthEvent::Failed => Level::Debug,
+                AuthEvent::Failed | AuthEvent::TokenExpired => Level::Debug,
                 AuthEvent::MissingTotp => Level::Trace,
                 AuthEvent::TooManyAttempts => Level::Warn,
                 AuthEvent::Error => Level::Error,
-                AuthEvent::Success => Level::Info,
+                AuthEvent::Success | AuthEvent::ClientRegistration => Level::Info,
             },
             EventType::Config(cause) => match cause {
                 ConfigEvent::ParseError
@@ -344,7 +345,7 @@ impl EventType {
                 SpamEvent::ListUpdated => Level::Info,
             },
             EventType::Http(event) => match event {
-                HttpEvent::ConnectionStart | HttpEvent::ConnectionEnd => Level::Info,
+                HttpEvent::ConnectionStart | HttpEvent::ConnectionEnd => Level::Debug,
                 HttpEvent::XForwardedMissing => Level::Warn,
                 HttpEvent::Error | HttpEvent::RequestUrl => Level::Debug,
                 HttpEvent::RequestBody | HttpEvent::ResponseBody => Level::Trace,
@@ -361,9 +362,7 @@ impl EventType {
                 | ClusterEvent::PeerSuspectedIsAlive
                 | ClusterEvent::PeerBackOnline
                 | ClusterEvent::PeerLeaving => Level::Info,
-                ClusterEvent::PeerHasConfigChanges
-                | ClusterEvent::PeerHasListChanges
-                | ClusterEvent::OneOrMorePeersOffline => Level::Debug,
+                ClusterEvent::PeerHasChanges | ClusterEvent::OneOrMorePeersOffline => Level::Debug,
                 ClusterEvent::EmptyPacket
                 | ClusterEvent::Error
                 | ClusterEvent::DecryptionError
@@ -534,6 +533,10 @@ impl EventType {
                 MessageIngestEvent::Error => Level::Error,
             },
             EventType::Security(_) => Level::Info,
+            EventType::Ai(event) => match event {
+                AiEvent::LlmResponse => Level::Trace,
+                AiEvent::ApiError => Level::Warn,
+            },
         }
     }
 }

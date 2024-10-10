@@ -6,13 +6,17 @@
 
 use std::time::Instant;
 
+use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::receiver::Request;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::core::{Command, Session, StatusResponse};
 
-impl<T: AsyncRead + AsyncWrite> Session<T> {
+impl<T: SessionStream> Session<T> {
     pub async fn handle_checkscript(&mut self, request: Request<Command>) -> trc::Result<Vec<u8>> {
+        // Validate access
+        self.assert_has_permission(Permission::SieveCheckScript)?;
+
         let op_start = Instant::now();
 
         if request.tokens.is_empty() {
@@ -22,7 +26,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
         }
 
         let script = request.tokens.into_iter().next().unwrap().unwrap_bytes();
-        self.jmap
+        self.server
             .core
             .sieve
             .untrusted_compiler

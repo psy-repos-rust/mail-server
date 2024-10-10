@@ -6,21 +6,26 @@
 
 use std::time::Instant;
 
+use common::listener::SessionStream;
+use directory::Permission;
+use jmap::JmapMethods;
 use jmap_proto::{
     object::Object,
     types::{collection::Collection, property::Property, value::Value},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 use trc::AddContext;
 
 use crate::core::{Session, StatusResponse};
 
-impl<T: AsyncRead + AsyncWrite> Session<T> {
+impl<T: SessionStream> Session<T> {
     pub async fn handle_listscripts(&mut self) -> trc::Result<Vec<u8>> {
+        // Validate access
+        self.assert_has_permission(Permission::SieveListScripts)?;
+
         let op_start = Instant::now();
         let account_id = self.state.access_token().primary_id();
         let document_ids = self
-            .jmap
+            .server
             .get_document_ids(account_id, Collection::SieveScript)
             .await
             .caused_by(trc::location!())?
@@ -35,7 +40,7 @@ impl<T: AsyncRead + AsyncWrite> Session<T> {
 
         for document_id in document_ids {
             if let Some(script) = self
-                .jmap
+                .server
                 .get_property::<Object<Value>>(
                     account_id,
                     Collection::SieveScript,

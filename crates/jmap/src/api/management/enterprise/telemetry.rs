@@ -13,11 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::telemetry::{
-    metrics::store::{Metric, MetricsStore},
-    tracers::store::{TracingQuery, TracingStore},
+use common::{
+    auth::{oauth::GrantType, AccessToken},
+    telemetry::{
+        metrics::store::{Metric, MetricsStore},
+        tracers::store::{TracingQuery, TracingStore},
+    },
+    Server,
 };
-use directory::backend::internal::manage;
+use directory::{backend::internal::manage, Permission};
 use http_body_util::{combinators::BoxBody, StreamBody};
 use hyper::{
     body::{Bytes, Frame},
@@ -25,6 +29,7 @@ use hyper::{
 };
 use mail_parser::DateTime;
 use serde_json::json;
+use std::future::Future;
 use store::ahash::{AHashMap, AHashSet};
 use trc::{
     ipc::{bitset::Bitset, subscriber::SubscriberBuilder},
@@ -33,22 +38,29 @@ use trc::{
 };
 use utils::{snowflake::SnowflakeIdGenerator, url_params::UrlParams};
 
-use crate::{
-    api::{
-        http::ToHttpResponse, management::Timestamp, HttpRequest, HttpResponse, HttpResponseBody,
-        JsonResponse,
-    },
-    JMAP,
+use crate::api::{
+    http::ToHttpResponse, management::Timestamp, HttpRequest, HttpResponse, HttpResponseBody,
+    JsonResponse,
 };
 
-impl JMAP {
-    pub async fn handle_telemetry_api_request(
+pub trait TelemetryApi: Sync + Send {
+    fn handle_telemetry_api_request(
         &self,
         req: &HttpRequest,
         path: Vec<&str>,
-        account_id: u32,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl TelemetryApi for Server {
+    async fn handle_telemetry_api_request(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+        access_token: &AccessToken,
     ) -> trc::Result<HttpResponse> {
         let params = UrlParams::new(req.uri().query());
+        let account_id = access_token.primary_id();
 
         match (
             path.get(1).copied().unwrap_or_default(),
@@ -56,6 +68,9 @@ impl JMAP {
             req.method(),
         ) {
             ("traces", None, &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::TracingList)?;
+
                 let page: usize = params.parse("page").unwrap_or(0);
                 let limit: usize = params.parse("limit").unwrap_or(0);
                 let mut tracing_query = Vec::new();
@@ -162,6 +177,9 @@ impl JMAP {
                 }
             }
             ("traces", Some("live"), &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::TracingLive)?;
+
                 let mut key_filters = AHashMap::new();
                 let mut filter = None;
 
@@ -290,6 +308,9 @@ impl JMAP {
                 })
             }
             ("trace", id, &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::TracingGet)?;
+
                 let store = &self
                     .core
                     .enterprise
@@ -327,15 +348,32 @@ impl JMAP {
                     .into_http_response())
                 }
             }
-            ("live", Some("token"), &Method::GET) => {
+            ("live", Some("tracing-token"), &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::TracingLive)?;
+
                 // Issue a live telemetry token valid for 60 seconds
 
                 Ok(JsonResponse::new(json!({
-                    "data": self.issue_custom_token(account_id, "live_telemetry", "web", 60).await?,
+                    "data": self.encode_access_token(GrantType::LiveTracing, account_id,  "web", 60).await?,
+            }))
+            .into_http_response())
+            }
+            ("live", Some("metrics-token"), &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MetricsLive)?;
+
+                // Issue a live telemetry token valid for 60 seconds
+
+                Ok(JsonResponse::new(json!({
+                    "data": self.encode_access_token(GrantType::LiveMetrics, account_id, "web", 60).await?,
             }))
             .into_http_response())
             }
             ("metrics", None, &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MetricsList)?;
+
                 let before = params
                     .parse::<Timestamp>("before")
                     .map(|t| t.into_inner())
@@ -395,6 +433,9 @@ impl JMAP {
                 .into_http_response())
             }
             ("metrics", Some("live"), &Method::GET) => {
+                // Validate the access token
+                access_token.assert_has_permission(Permission::MetricsLive)?;
+
                 let interval = Duration::from_secs(
                     params
                         .parse::<u64>("interval")
@@ -422,9 +463,9 @@ impl JMAP {
                 ] {
                     if metric_types.contains(&metric_type) {
                         let value = match metric_type {
-                            MetricType::QueueCount => self.core.total_queued_messages().await?,
-                            MetricType::UserCount => self.core.total_accounts().await?,
-                            MetricType::DomainCount => self.core.total_domains().await?,
+                            MetricType::QueueCount => self.total_queued_messages().await?,
+                            MetricType::UserCount => self.total_accounts().await?,
+                            MetricType::DomainCount => self.total_domains().await?,
                             _ => unreachable!(),
                         };
                         Collector::update_gauge(metric_type, value);

@@ -16,7 +16,7 @@ use reqwest::{header::AUTHORIZATION, Method, StatusCode};
 
 use crate::{
     jmap::ManagementApi,
-    smtp::{outbound::TestServer, session::TestSession},
+    smtp::{session::TestSession, TestSMTP},
 };
 use smtp::queue::{manager::SpawnQueue, QueueId, Status};
 
@@ -56,7 +56,7 @@ reject-non-fqdn = false
 relay = true
 "#;
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug)]
 #[allow(dead_code)]
 pub(super) struct List<T> {
     pub items: Vec<T>,
@@ -69,14 +69,13 @@ async fn manage_queue() {
     // Enable logging
     crate::enable_logging();
 
-
     // Start remote test server
-    let mut remote = TestServer::new("smtp_manage_queue_remote", REMOTE, true).await;
+    let mut remote = TestSMTP::new("smtp_manage_queue_remote", REMOTE).await;
     let _rx = remote.start(&[ServerProtocol::Smtp]).await;
     let remote_core = remote.build_smtp();
 
     // Start local management interface
-    let local = TestServer::new("smtp_manage_queue_local", LOCAL, true).await;
+    let local = TestSMTP::new("smtp_manage_queue_local", LOCAL).await;
 
     // Add mock DNS entries
     let core = local.build_smtp();
@@ -135,7 +134,10 @@ async fn manage_queue() {
         ("f", ("", vec!["success@foobar.org", "delay@foobar.org"])),
     ]);
     let mut session = local.new_session();
-    local.qr.queue_rx.spawn(local.instance.clone());
+    local
+        .queue_receiver
+        .queue_rx
+        .spawn(local.server.inner.clone());
     session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.ehlo("foobar.net").await;
@@ -161,7 +163,7 @@ async fn manage_queue() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         remote
-            .qr
+            .queue_receiver
             .consume_message(&remote_core)
             .await
             .recipients
@@ -316,7 +318,7 @@ async fn manage_queue() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         remote
-            .qr
+            .queue_receiver
             .consume_message(&remote_core)
             .await
             .recipients

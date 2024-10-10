@@ -6,8 +6,10 @@
 
 use std::borrow::Cow;
 
-use common::listener::stream::NullIo;
-use directory::QueryBy;
+use common::{
+    auth::AccessToken, listener::stream::NullIo, scripts::plugins::PluginContext, Server,
+};
+use directory::{backend::internal::PrincipalField, QueryBy};
 use jmap_proto::types::{collection::Collection, id::Id, keyword::Keyword, property::Property};
 use mail_parser::MessageParser;
 use sieve::{Envelope, Event, Input, Mailbox, Recipient};
@@ -19,13 +21,14 @@ use store::{
 use trc::{AddContext, SieveEvent};
 
 use crate::{
-    email::ingest::{IngestEmail, IngestSource, IngestedEmail},
-    mailbox::{INBOX_ID, TRASH_ID},
+    email::ingest::{EmailIngest, IngestEmail, IngestSource, IngestedEmail},
+    mailbox::{get::MailboxGet, set::MailboxSet, INBOX_ID, TRASH_ID},
     sieve::SeenIdHash,
-    JMAP,
+    JmapMethods,
 };
 
-use super::ActiveScript;
+use super::{get::SieveScriptGet, ActiveScript};
+use std::future::Future;
 
 struct SieveMessage<'x> {
     pub raw_message: Cow<'x, [u8]>,
@@ -33,14 +36,26 @@ struct SieveMessage<'x> {
     pub flags: Vec<Keyword>,
 }
 
-impl JMAP {
-    #[allow(clippy::blocks_in_conditions)]
-    pub async fn sieve_script_ingest(
+pub trait SieveScriptIngest: Sync + Send {
+    fn sieve_script_ingest(
         &self,
+        access_token: &AccessToken,
         raw_message: &[u8],
         envelope_from: &str,
         envelope_to: &str,
-        account_id: u32,
+        session_id: u64,
+        active_script: ActiveScript,
+    ) -> impl Future<Output = trc::Result<IngestedEmail>> + Send;
+}
+
+impl SieveScriptIngest for Server {
+    #[allow(clippy::blocks_in_conditions)]
+    async fn sieve_script_ingest(
+        &self,
+        access_token: &AccessToken,
+        raw_message: &[u8],
+        envelope_from: &str,
+        envelope_to: &str,
         session_id: u64,
         mut active_script: ActiveScript,
     ) -> trc::Result<IngestedEmail> {
@@ -56,6 +71,7 @@ impl JMAP {
         };
 
         // Obtain mailboxIds
+        let account_id = access_token.primary_id;
         let mailbox_ids = self
             .mailbox_get_or_create(account_id)
             .await
@@ -64,23 +80,21 @@ impl JMAP {
         // Create Sieve instance
         let mut instance = self.core.sieve.untrusted_runtime.filter_parsed(message);
 
-        // Set account name and obtain quota
-        let (account_quota, mail_from) = match self
+        // Set account name and email
+        let mail_from = self
             .core
             .storage
             .directory
             .query(QueryBy::Id(account_id), false)
             .await
-        {
-            Ok(Some(p)) => {
+            .caused_by(trc::location!())?
+            .and_then(|mut p| {
                 instance.set_user_full_name(p.description().unwrap_or_else(|| p.name()));
-                (p.quota as i64, p.emails.into_iter().next())
-            }
-            Ok(None) => (0, None),
-            Err(err) => {
-                return Err(err.caused_by(trc::location!()));
-            }
-        };
+                p.take_str_array(PrincipalField::Emails)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+            });
 
         // Set account address
         let mail_from = mail_from.unwrap_or_else(|| envelope_to.to_string());
@@ -125,8 +139,7 @@ impl JMAP {
                             }
                         }
                         sieve::Script::Global(name_) => {
-                            if let Some(script) =
-                                self.core.get_untrusted_sieve_script(name_, session_id)
+                            if let Some(script) = self.get_untrusted_sieve_script(name_, session_id)
                             {
                                 input = Input::script(name, script.clone());
                             } else {
@@ -354,7 +367,7 @@ impl JMAP {
                                 );
 
                                 Session::<NullIo>::sieve(
-                                    self.smtp.clone(),
+                                    self.clone(),
                                     SessionAddress::new(mail_from.clone()),
                                     recipients,
                                     message.raw_message.to_vec(),
@@ -387,11 +400,26 @@ impl JMAP {
                         }
                     }
                     Event::ListContains { .. }
-                    | Event::Function { .. }
                     | Event::Notify { .. }
                     | Event::SetEnvelope { .. } => {
                         // Not allowed
                         input = false.into();
+                    }
+                    Event::Function { id, arguments } => {
+                        input = self
+                            .core
+                            .run_plugin(
+                                id,
+                                PluginContext {
+                                    session_id,
+                                    server: self,
+                                    message: instance.message(),
+                                    modifications: &mut Vec::new(),
+                                    access_token: access_token.into(),
+                                    arguments,
+                                },
+                            )
+                            .await;
                     }
                     Event::CreatedMessage { message, .. } => {
                         messages.push(SieveMessage {
@@ -452,8 +480,7 @@ impl JMAP {
                     .email_ingest(IngestEmail {
                         raw_message: &sieve_message.raw_message,
                         message: message.into(),
-                        account_id,
-                        account_quota,
+                        resource: access_token.as_resource_token(),
                         mailbox_ids: sieve_message.file_into,
                         keywords: sieve_message.flags,
                         received_at: None,

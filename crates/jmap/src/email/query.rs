@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
     method::query::{Comparator, Filter, QueryRequest, QueryResponse, SortProperty},
     object::email::QueryArguments,
@@ -11,6 +12,7 @@ use jmap_proto::{
 };
 use mail_parser::HeaderName;
 use nlp::language::Language;
+use std::future::Future;
 use store::{
     fts::{Field, FilterGroup, FtsFilter, IntoFilterGroup},
     query::{self},
@@ -19,10 +21,27 @@ use store::{
     ValueKey,
 };
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{auth::acl::AclMethods, JmapMethods};
 
-impl JMAP {
-    pub async fn email_query(
+use super::cache::ThreadCache;
+
+pub trait EmailQuery: Sync + Send {
+    fn email_query(
+        &self,
+        request: QueryRequest<QueryArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
+
+    fn thread_keywords(
+        &self,
+        account_id: u32,
+        keyword: Keyword,
+        match_all: bool,
+    ) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
+}
+
+impl EmailQuery for Server {
+    async fn email_query(
         &self,
         mut request: QueryRequest<QueryArguments>,
         access_token: &AccessToken,

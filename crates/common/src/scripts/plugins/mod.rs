@@ -9,6 +9,7 @@ pub mod dns;
 pub mod exec;
 pub mod headers;
 pub mod http;
+pub mod llm_prompt;
 pub mod lookup;
 pub mod pyzor;
 pub mod query;
@@ -17,7 +18,7 @@ pub mod text;
 use mail_parser::Message;
 use sieve::{runtime::Variable, FunctionMap, Input};
 
-use crate::{config::scripts::ScriptCache, Core};
+use crate::{auth::AccessToken, Core, Server};
 
 use super::ScriptModification;
 
@@ -25,14 +26,14 @@ type RegisterPluginFnc = fn(u32, &mut FunctionMap) -> ();
 
 pub struct PluginContext<'x> {
     pub session_id: u64,
-    pub core: &'x Core,
-    pub cache: &'x ScriptCache,
+    pub access_token: Option<&'x AccessToken>,
+    pub server: &'x Server,
     pub message: &'x Message<'x>,
     pub modifications: &'x mut Vec<ScriptModification>,
     pub arguments: Vec<Variable>,
 }
 
-const PLUGINS_REGISTER: [RegisterPluginFnc; 18] = [
+const PLUGINS_REGISTER: [RegisterPluginFnc; 19] = [
     query::register,
     exec::register,
     lookup::register,
@@ -51,14 +52,16 @@ const PLUGINS_REGISTER: [RegisterPluginFnc; 18] = [
     headers::register,
     text::register_tokenize,
     text::register_domain_part,
+    llm_prompt::register,
 ];
 
 pub trait RegisterSievePlugins {
-    fn register_plugins(self) -> Self;
+    fn register_plugins_trusted(self) -> Self;
+    fn register_plugins_untrusted(self) -> Self;
 }
 
 impl RegisterSievePlugins for FunctionMap {
-    fn register_plugins(mut self) -> Self {
+    fn register_plugins_trusted(mut self) -> Self {
         #[cfg(feature = "test_mode")]
         {
             self.set_external_function("print", PLUGINS_REGISTER.len() as u32, 1)
@@ -67,6 +70,11 @@ impl RegisterSievePlugins for FunctionMap {
         for (i, fnc) in PLUGINS_REGISTER.iter().enumerate() {
             fnc(i as u32, &mut self);
         }
+        self
+    }
+
+    fn register_plugins_untrusted(mut self) -> Self {
+        llm_prompt::register(18, &mut self);
         self
     }
 }
@@ -98,6 +106,7 @@ impl Core {
             15 => headers::exec(ctx),
             16 => text::exec_tokenize(ctx),
             17 => text::exec_domain_part(ctx),
+            18 => llm_prompt::exec(ctx).await,
             _ => unreachable!(),
         };
 

@@ -5,17 +5,16 @@ use std::{
 };
 
 use chrono::DateTime;
-use directory::backend::internal::manage;
+use common::{auth::AccessToken, Server};
+use directory::{backend::internal::manage, Permission};
 use rev_lines::RevLines;
 use serde::Serialize;
 use serde_json::json;
+use std::future::Future;
 use tokio::sync::oneshot;
 use utils::url_params::UrlParams;
 
-use crate::{
-    api::{http::ToHttpResponse, HttpRequest, HttpResponse, JsonResponse},
-    JMAP,
-};
+use crate::api::{http::ToHttpResponse, HttpRequest, HttpResponse, JsonResponse};
 
 #[derive(Serialize)]
 struct LogEntry {
@@ -26,8 +25,23 @@ struct LogEntry {
     details: String,
 }
 
-impl JMAP {
-    pub async fn handle_view_logs(&self, req: &HttpRequest) -> trc::Result<HttpResponse> {
+pub trait LogManagement: Sync + Send {
+    fn handle_view_logs(
+        &self,
+        req: &HttpRequest,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl LogManagement for Server {
+    async fn handle_view_logs(
+        &self,
+        req: &HttpRequest,
+        access_token: &AccessToken,
+    ) -> trc::Result<HttpResponse> {
+        // Validate the access token
+        access_token.assert_has_permission(Permission::LogsView)?;
+
         let path = self
             .core
             .metrics

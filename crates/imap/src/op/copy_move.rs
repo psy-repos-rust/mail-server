@@ -6,17 +6,24 @@
 
 use std::{sync::Arc, time::Instant};
 
+use directory::Permission;
 use imap_proto::{
     protocol::copy_move::Arguments, receiver::Request, Command, ResponseCode, ResponseType,
     StatusResponse,
 };
 
 use crate::{
-    core::{MailboxId, SelectedMailbox, Session, SessionData},
+    core::{SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-use common::listener::SessionStream;
-use jmap::{email::set::TagManager, mailbox::UidMailbox};
+use common::{listener::SessionStream, MailboxId};
+use jmap::{
+    changes::write::ChangeLog,
+    email::{copy::EmailCopy, ingest::EmailIngest, set::TagManager},
+    mailbox::UidMailbox,
+    services::state::StateManager,
+    JmapMethods,
+};
 use jmap_proto::{
     error::set::SetErrorType,
     types::{
@@ -38,6 +45,13 @@ impl<T: SessionStream> Session<T> {
         is_move: bool,
         is_uid: bool,
     ) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(if is_move {
+            Permission::ImapMove
+        } else {
+            Permission::ImapCopy
+        })?;
+
         let op_start = Instant::now();
         let arguments = request.parse_copy_move(self.version)?;
         let (data, src_mailbox) = self.state.mailbox_state();
@@ -192,7 +206,7 @@ impl<T: SessionStream> SessionData<T> {
                 for uid_mailbox in mailboxes.inner_tags_mut() {
                     if uid_mailbox.uid == 0 {
                         let assigned_uid = self
-                            .jmap
+                            .server
                             .assign_imap_uid(account_id, uid_mailbox.mailbox_id)
                             .await
                             .imap_ctx(&arguments.tag, trc::location!())?;
@@ -211,13 +225,13 @@ impl<T: SessionStream> SessionData<T> {
                 mailboxes.update_batch(&mut batch, Property::MailboxIds);
                 if changelog.change_id == u64::MAX {
                     changelog.change_id = self
-                        .jmap
+                        .server
                         .assign_change_id(account_id)
                         .await
                         .imap_ctx(&arguments.tag, trc::location!())?;
                 }
                 batch.value(Property::Cid, changelog.change_id, F_VALUE);
-                self.jmap
+                self.server
                     .write_batch(batch)
                     .await
                     .imap_ctx(&arguments.tag, trc::location!())?;
@@ -233,21 +247,20 @@ impl<T: SessionStream> SessionData<T> {
             let src_account_id = src_mailbox.id.account_id;
             let mut dest_change_id = None;
             let dest_account_id = dest_mailbox.account_id;
-            let dest_quota = self
-                .jmap
+            let resource_token = self
+                .server
                 .get_cached_access_token(dest_account_id)
                 .await
                 .imap_ctx(&arguments.tag, trc::location!())?
-                .quota as i64;
+                .as_resource_token();
             let mut destroy_ids = RoaringBitmap::new();
             for (id, imap_id) in ids {
                 match self
-                    .jmap
+                    .server
                     .copy_message(
                         src_account_id,
                         id,
-                        dest_account_id,
-                        dest_quota,
+                        &resource_token,
                         vec![dest_mailbox_id],
                         Vec::new(),
                         None,
@@ -295,7 +308,7 @@ impl<T: SessionStream> SessionData<T> {
 
             // Broadcast changes on destination account
             if let Some(change_id) = dest_change_id {
-                self.jmap
+                self.server
                     .broadcast_state_change(
                         StateChange::new(dest_account_id)
                             .with_change(DataType::Email, change_id)
@@ -309,11 +322,11 @@ impl<T: SessionStream> SessionData<T> {
         // Write changes on source account
         if !changelog.is_empty() {
             let change_id = self
-                .jmap
+                .server
                 .commit_changes(src_mailbox.id.account_id, changelog)
                 .await
                 .imap_ctx(&arguments.tag, trc::location!())?;
-            self.jmap
+            self.server
                 .broadcast_state_change(
                     StateChange::new(src_mailbox.id.account_id)
                         .with_change(DataType::Email, change_id)
@@ -415,7 +428,7 @@ impl<T: SessionStream> SessionData<T> {
     ) -> trc::Result<Option<(TagManager<UidMailbox>, u32)>> {
         // Obtain mailbox tags
         if let (Some(mailboxes), Some(thread_id)) = (
-            self.jmap
+            self.server
                 .get_property::<HashedValue<Vec<UidMailbox>>>(
                     account_id,
                     Collection::Email,
@@ -423,7 +436,7 @@ impl<T: SessionStream> SessionData<T> {
                     Property::MailboxIds,
                 )
                 .await?,
-            self.jmap
+            self.server
                 .get_property::<u32>(account_id, Collection::Email, id, Property::ThreadId)
                 .await?,
         ) {

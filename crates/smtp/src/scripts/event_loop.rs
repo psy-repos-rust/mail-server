@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Instant};
 
-use common::scripts::plugins::PluginContext;
+use common::{scripts::plugins::PluginContext, Server};
 use mail_auth::common::headers::HeaderWriter;
 use sieve::{
     compiler::grammar::actions::action_redirect::{ByMode, ByTime, Notify, NotifyItem, Ret},
@@ -19,20 +19,27 @@ use smtp_proto::{
 use trc::SieveEvent;
 
 use crate::{
-    core::SMTP,
     inbound::DkimSign,
-    queue::{DomainPart, MessageSource},
+    queue::{quota::HasQueueQuota, spool::SmtpSpool, DomainPart, MessageSource},
 };
 
 use super::{ScriptModification, ScriptParameters, ScriptResult};
 
-impl SMTP {
-    pub async fn run_script(
+pub trait RunScript: Sync + Send {
+    fn run_script(
         &self,
         script_id: String,
         script: Arc<Sieve>,
         params: ScriptParameters<'_>,
-        session_id: u64,
+    ) -> impl Future<Output = ScriptResult> + Send;
+}
+
+impl RunScript for Server {
+    async fn run_script(
+        &self,
+        script_id: String,
+        script: Arc<Sieve>,
+        params: ScriptParameters<'_>,
     ) -> ScriptResult {
         // Create filter instance
         let time = Instant::now();
@@ -47,6 +54,7 @@ impl SMTP {
             .with_user_full_name(&params.from_name);
         let mut input = Input::script("__script", script);
         let mut messages: Vec<Vec<u8>> = Vec::new();
+        let session_id = params.session_id;
 
         let mut reject_reason = None;
         let mut modifications = vec![];
@@ -112,10 +120,10 @@ impl SMTP {
                                 id,
                                 PluginContext {
                                     session_id,
-                                    core: &self.core,
-                                    cache: &self.inner.script_cache,
+                                    server: self,
                                     message: instance.message(),
                                     modifications: &mut modifications,
+                                    access_token: params.access_token,
                                     arguments,
                                 },
                             )
@@ -264,8 +272,7 @@ impl SMTP {
                                 let mut headers = Vec::new();
 
                                 for dkim in &params.sign {
-                                    if let Some(dkim) = self.core.get_dkim_signer(dkim, session_id)
-                                    {
+                                    if let Some(dkim) = self.get_dkim_signer(dkim, session_id) {
                                         match dkim.sign(raw_message) {
                                             Ok(signature) => {
                                                 signature.write_header(&mut headers);

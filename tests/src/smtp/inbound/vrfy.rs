@@ -9,12 +9,14 @@ use common::Core;
 use store::Stores;
 use utils::config::Config;
 
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 
-use crate::smtp::{
-    build_smtp,
-    session::{TestSession, VerifyResponse},
-    TempDir,
+use crate::{
+    smtp::{
+        session::{TestSession, VerifyResponse},
+        TempDir, TestSMTP,
+    },
+    AssertConfig,
 };
 
 const CONFIG: &str = r#"
@@ -23,6 +25,7 @@ data = "sqlite"
 lookup = "sqlite"
 blob = "sqlite"
 fts = "sqlite"
+directory = "local"
 
 [store."sqlite"]
 type = "sqlite"
@@ -72,9 +75,10 @@ async fn vrfy_expn() {
     let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
     let stores = Stores::parse_all(&mut config).await;
     let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
     // EHLO should not advertise VRFY/EXPN to 10.0.0.2
-    let mut session = Session::test(build_smtp(core, Inner::default()));
+    let mut session = Session::test(TestSMTP::from_core(core).server);
     session.data.remote_ip_str = "10.0.0.2".to_string();
     session.eval_session_params().await;
     session

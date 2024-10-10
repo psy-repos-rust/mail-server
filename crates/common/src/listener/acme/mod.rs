@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use dns_update::DnsUpdater;
 use rustls::sign::CertifiedKey;
 
-use crate::Core;
+use crate::Server;
 
 use self::directory::{Account, ChallengeType};
 
@@ -26,9 +26,16 @@ pub struct AcmeProvider {
     pub domains: Vec<String>,
     pub contact: Vec<String>,
     pub challenge: ChallengeSettings,
+    pub eab: Option<EabSettings>,
     renew_before: chrono::Duration,
     account_key: ArcSwap<Vec<u8>>,
     default: bool,
+}
+
+#[derive(Clone)]
+pub struct EabSettings {
+    pub kid: String,
+    pub hmac_key: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -49,12 +56,14 @@ pub struct StaticResolver {
 }
 
 impl AcmeProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         directory_url: String,
         domains: Vec<String>,
         contact: Vec<String>,
         challenge: ChallengeSettings,
+        eab: Option<EabSettings>,
         renew_before: Duration,
         default: bool,
     ) -> trc::Result<Self> {
@@ -75,12 +84,13 @@ impl AcmeProvider {
             domains,
             account_key: Default::default(),
             challenge,
+            eab,
             default,
         })
     }
 }
 
-impl Core {
+impl Server {
     pub async fn init_acme(&self, provider: &AcmeProvider) -> trc::Result<Duration> {
         // Load account key from cache or generate a new one
         if let Some(account_key) = self.load_account(provider).await? {
@@ -100,15 +110,17 @@ impl Core {
     }
 
     pub fn has_acme_tls_providers(&self) -> bool {
-        self.tls
-            .acme_providers
+        self.core
+            .acme
+            .providers
             .values()
             .any(|p| matches!(p.challenge, ChallengeSettings::TlsAlpn01))
     }
 
     pub fn has_acme_http_providers(&self) -> bool {
-        self.tls
-            .acme_providers
+        self.core
+            .acme
+            .providers
             .values()
             .any(|p| matches!(p.challenge, ChallengeSettings::Http01))
     }
@@ -140,6 +152,7 @@ impl Clone for AcmeProvider {
             challenge: self.challenge.clone(),
             renew_before: self.renew_before,
             account_key: ArcSwap::from_pointee(self.account_key.load().as_ref().clone()),
+            eab: self.eab.clone(),
             default: self.default,
         }
     }

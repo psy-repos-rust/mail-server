@@ -51,6 +51,7 @@ impl EventType {
             EventType::Telemetry(event) => event.description(),
             EventType::MessageIngest(event) => event.description(),
             EventType::Security(event) => event.description(),
+            EventType::Ai(event) => event.description(),
         }
     }
 
@@ -98,6 +99,7 @@ impl EventType {
             EventType::Telemetry(event) => event.explain(),
             EventType::MessageIngest(event) => event.explain(),
             EventType::Security(event) => event.explain(),
+            EventType::Ai(event) => event.explain(),
         }
     }
 }
@@ -138,8 +140,7 @@ impl ClusterEvent {
             ClusterEvent::PeerSuspectedIsAlive => "A suspected peer is actually alive",
             ClusterEvent::PeerBackOnline => "A peer came back online",
             ClusterEvent::PeerLeaving => "A peer is leaving the cluster",
-            ClusterEvent::PeerHasConfigChanges => "A peer has configuration changes",
-            ClusterEvent::PeerHasListChanges => "A peer has list changes",
+            ClusterEvent::PeerHasChanges => "A peer has reported changes",
             ClusterEvent::OneOrMorePeersOffline => "One or more peers are offline",
             ClusterEvent::EmptyPacket => "Received an empty gossip packet",
             ClusterEvent::InvalidPacket => "Received an invalid gossip packet",
@@ -157,8 +158,7 @@ impl ClusterEvent {
             ClusterEvent::PeerSuspectedIsAlive => "A suspected peer is actually alive",
             ClusterEvent::PeerBackOnline => "A peer came back online",
             ClusterEvent::PeerLeaving => "A peer is leaving the cluster",
-            ClusterEvent::PeerHasConfigChanges => "A peer has configuration changes",
-            ClusterEvent::PeerHasListChanges => "A peer has list changes",
+            ClusterEvent::PeerHasChanges => "A peer has reported changes",
             ClusterEvent::OneOrMorePeersOffline => "One or more peers are offline",
             ClusterEvent::EmptyPacket => "Received an empty gossip packet",
             ClusterEvent::InvalidPacket => "Received an invalid gossip packet",
@@ -1691,6 +1691,7 @@ impl LimitEvent {
             LimitEvent::Quota => "Quota limit reached",
             LimitEvent::BlobQuota => "Blob quota limit reached",
             LimitEvent::TooManyRequests => "Too many requests",
+            LimitEvent::TenantQuota => "Tenant quota limit reached",
         }
     }
 
@@ -1705,6 +1706,7 @@ impl LimitEvent {
             LimitEvent::Quota => "The quota limit has been reached",
             LimitEvent::BlobQuota => "The blob quota limit has been reached",
             LimitEvent::TooManyRequests => "Too many requests have been made",
+            LimitEvent::TenantQuota => "One of the tenant quota limits has been reached",
         }
     }
 }
@@ -1741,6 +1743,8 @@ impl AuthEvent {
             AuthEvent::MissingTotp => "Missing TOTP for authentication",
             AuthEvent::TooManyAttempts => "Too many authentication attempts",
             AuthEvent::Error => "Authentication error",
+            AuthEvent::TokenExpired => "OAuth token expired",
+            AuthEvent::ClientRegistration => "OAuth Client registration",
         }
     }
 
@@ -1751,6 +1755,8 @@ impl AuthEvent {
             AuthEvent::MissingTotp => "TOTP is missing for authentication",
             AuthEvent::TooManyAttempts => "Too many authentication attempts have been made",
             AuthEvent::Error => "An error occurred with authentication",
+            AuthEvent::TokenExpired => "OAuth authentication token has expired",
+            AuthEvent::ClientRegistration => "OAuth client successfully registered",
         }
     }
 }
@@ -1781,9 +1787,11 @@ impl SecurityEvent {
     pub fn description(&self) -> &'static str {
         match self {
             SecurityEvent::AuthenticationBan => "Banned due to authentication errors",
-            SecurityEvent::BruteForceBan => "Banned due to brute force attack",
+            SecurityEvent::AbuseBan => "Banned due to abuse",
             SecurityEvent::LoiterBan => "Banned due to loitering",
             SecurityEvent::IpBlocked => "Blocked IP address",
+            SecurityEvent::ScanBan => "Banned due to scan",
+            SecurityEvent::Unauthorized => "Unauthorized access",
         }
     }
 
@@ -1792,11 +1800,29 @@ impl SecurityEvent {
             SecurityEvent::AuthenticationBan => {
                 "IP address was banned due to multiple authentication errors"
             }
-            SecurityEvent::BruteForceBan => {
-                "IP address was banned due to possible brute force attack"
+            SecurityEvent::AbuseBan => {
+                "IP address was banned due to abuse, such as RCPT TO attacks"
             }
+            SecurityEvent::ScanBan => "IP address was banned due to exploit scanning",
             SecurityEvent::LoiterBan => "IP address was banned due to multiple loitering events",
             SecurityEvent::IpBlocked => "Rejected connection from blocked IP address",
+            SecurityEvent::Unauthorized => "Account does not have permission to access resource",
+        }
+    }
+}
+
+impl AiEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            AiEvent::LlmResponse => "LLM response",
+            AiEvent::ApiError => "AI API error",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            AiEvent::LlmResponse => "An LLM response has been received",
+            AiEvent::ApiError => "An AI API error occurred",
         }
     }
 }

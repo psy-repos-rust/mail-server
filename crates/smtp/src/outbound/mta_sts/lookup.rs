@@ -13,16 +13,36 @@ use std::{
 #[cfg(feature = "test_mode")]
 pub static STS_TEST_POLICY: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
 
-use common::config::smtp::resolver::Policy;
+use common::{config::smtp::resolver::Policy, Server};
 use mail_auth::{common::lru::DnsCache, mta_sts::MtaSts, report::tlsrpt::ResultType};
-
-use crate::core::SMTP;
 
 use super::{parse::ParsePolicy, Error};
 
+#[cfg(not(feature = "test_mode"))]
+use common::HttpLimitResponse;
+
+#[cfg(not(feature = "test_mode"))]
+const MAX_POLICY_SIZE: usize = 1024 * 1024;
+
+pub trait MtaStsLookup: Sync + Send {
+    fn lookup_mta_sts_policy<'x>(
+        &self,
+        domain: &str,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<Arc<Policy>, Error>> + Send;
+
+    #[cfg(feature = "test_mode")]
+    fn policy_add<'x>(
+        &self,
+        key: impl mail_auth::common::resolver::IntoFqdn<'x>,
+        value: Policy,
+        valid_until: std::time::Instant,
+    );
+}
+
 #[allow(unused_variables)]
-impl SMTP {
-    pub async fn lookup_mta_sts_policy<'x>(
+impl MtaStsLookup for Server {
+    async fn lookup_mta_sts_policy<'x>(
         &self,
         domain: &str,
         timeout: Duration,
@@ -61,11 +81,12 @@ impl SMTP {
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()?
-            .get(&format!("https://mta-sts.{domain}/.well-known/mta-sts.txt"))
+            .get(format!("https://mta-sts.{domain}/.well-known/mta-sts.txt"))
             .send()
             .await?
-            .bytes()
-            .await?;
+            .bytes_with_limit(MAX_POLICY_SIZE)
+            .await?
+            .ok_or_else(|| Error::InvalidPolicy("Policy too large".to_string()))?;
         #[cfg(feature = "test_mode")]
         let bytes = STS_TEST_POLICY.lock().clone();
 
@@ -89,7 +110,7 @@ impl SMTP {
     }
 
     #[cfg(feature = "test_mode")]
-    pub fn policy_add<'x>(
+    fn policy_add<'x>(
         &self,
         key: impl mail_auth::common::resolver::IntoFqdn<'x>,
         value: Policy,

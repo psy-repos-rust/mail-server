@@ -14,7 +14,9 @@ use mail_auth::flate2;
 use sieve::{runtime::Variable, FunctionMap};
 use store::{Deserialize, Value};
 
-use crate::{config::scripts::RemoteList, scripts::into_sieve_value, USER_AGENT};
+use crate::{
+    config::scripts::RemoteList, scripts::into_sieve_value, HttpLimitResponse, USER_AGENT,
+};
 
 use super::PluginContext;
 
@@ -40,8 +42,8 @@ pub fn register_local_domain(plugin_id: u32, fnc_map: &mut FunctionMap) {
 
 pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     let store = match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.lookups.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.lookup),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -74,8 +76,8 @@ pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable> {
 
 pub async fn exec_get(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.lookups.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.lookup),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -95,8 +97,8 @@ pub async fn exec_set(ctx: PluginContext<'_>) -> trc::Result<Variable> {
     };
 
     match &ctx.arguments[0] {
-        Variable::String(v) if !v.is_empty() => ctx.core.storage.lookups.get(v.as_ref()),
-        _ => Some(&ctx.core.storage.lookup),
+        Variable::String(v) if !v.is_empty() => ctx.server.core.storage.lookups.get(v.as_ref()),
+        _ => Some(&ctx.server.core.storage.lookup),
     }
     .ok_or_else(|| {
         trc::SieveEvent::RuntimeError
@@ -123,7 +125,7 @@ pub async fn exec_remote(ctx: PluginContext<'_>) -> trc::Result<Variable> {
             // Something went wrong, try again in one hour
             const RETRY: Duration = Duration::from_secs(3600);
 
-            let mut _lock = ctx.cache.remote_lists.write();
+            let mut _lock = ctx.server.inner.data.remote_lists.write();
             let list = _lock
                 .entry(ctx.arguments[0].to_string().to_string())
                 .or_insert_with(|| RemoteList {
@@ -143,6 +145,8 @@ pub async fn exec_remote(ctx: PluginContext<'_>) -> trc::Result<Variable> {
         }
     }
 }
+
+const MAX_RESOURCE_SIZE: usize = 10 * 1024 * 1024;
 
 async fn exec_remote_(ctx: &PluginContext<'_>) -> trc::Result<Variable> {
     let resource = ctx.arguments[0].to_string();
@@ -165,7 +169,14 @@ async fn exec_remote_(ctx: &PluginContext<'_>) -> trc::Result<Variable> {
     const MAX_ENTRY_SIZE: usize = 256;
     const MAX_ENTRIES: usize = 100000;
 
-    match ctx.cache.remote_lists.read().get(resource.as_ref()) {
+    match ctx
+        .server
+        .inner
+        .data
+        .remote_lists
+        .read()
+        .get(resource.as_ref())
+    {
         Some(remote_list) if remote_list.expires < Instant::now() => {
             return Ok(remote_list.entries.contains(item.as_ref()).into())
         }
@@ -228,13 +239,22 @@ async fn exec_remote_(ctx: &PluginContext<'_>) -> trc::Result<Variable> {
         })?;
 
     if response.status().is_success() {
-        let bytes = response.bytes().await.map_err(|err| {
-            trc::SieveEvent::RuntimeError
-                .into_err()
-                .reason(err)
-                .ctx(trc::Key::Url, resource.to_string())
-                .details("Failed to fetch resource")
-        })?;
+        let bytes = response
+            .bytes_with_limit(MAX_RESOURCE_SIZE)
+            .await
+            .map_err(|err| {
+                trc::SieveEvent::RuntimeError
+                    .into_err()
+                    .reason(err)
+                    .ctx(trc::Key::Url, resource.to_string())
+                    .details("Failed to fetch resource")
+            })?
+            .ok_or_else(|| {
+                trc::SieveEvent::RuntimeError
+                    .into_err()
+                    .ctx(trc::Key::Url, resource.to_string())
+                    .details("Resource is too large")
+            })?;
 
         let reader: Box<dyn std::io::Read> = if resource.ends_with(".gz") {
             Box::new(flate2::read::GzDecoder::new(&bytes[..]))
@@ -243,7 +263,7 @@ async fn exec_remote_(ctx: &PluginContext<'_>) -> trc::Result<Variable> {
         };
 
         // Lock remote list for writing
-        let mut _lock = ctx.cache.remote_lists.write();
+        let mut _lock = ctx.server.inner.data.remote_lists.write();
         let list = _lock
             .entry(resource.to_string())
             .or_insert_with(|| RemoteList {
@@ -339,8 +359,10 @@ pub async fn exec_local_domain(ctx: PluginContext<'_>) -> trc::Result<Variable> 
 
     if !domain.is_empty() {
         return match &ctx.arguments[0] {
-            Variable::String(v) if !v.is_empty() => ctx.core.storage.directories.get(v.as_ref()),
-            _ => Some(&ctx.core.storage.directory),
+            Variable::String(v) if !v.is_empty() => {
+                ctx.server.core.storage.directories.get(v.as_ref())
+            }
+            _ => Some(&ctx.server.core.storage.directory),
         }
         .ok_or_else(|| {
             trc::SieveEvent::RuntimeError

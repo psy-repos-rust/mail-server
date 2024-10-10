@@ -5,14 +5,18 @@ use std::{
 
 use ahash::AHashMap;
 use common::{
+    auth::AccessToken,
     config::jmap::settings::SpecialUse,
     listener::{limiter::InFlight, SessionStream},
+    AccountId, Mailbox,
 };
-use directory::QueryBy;
+use directory::{backend::internal::PrincipalField, QueryBy};
 use imap_proto::protocol::list::Attribute;
 use jmap::{
-    auth::{acl::EffectiveAcl, AccessToken},
-    mailbox::INBOX_ID,
+    auth::acl::{AclMethods, EffectiveAcl},
+    changes::get::ChangesLookup,
+    mailbox::{get::MailboxGet, set::MailboxSet, INBOX_ID},
+    JmapMethods,
 };
 use jmap_proto::{
     object::Object,
@@ -23,28 +27,29 @@ use store::query::log::{Change, Query};
 use trc::AddContext;
 use utils::lru_cache::LruCached;
 
-use super::{Account, AccountId, Mailbox, MailboxId, MailboxSync, Session, SessionData};
+use super::{Account, MailboxId, MailboxSync, Session, SessionData};
 
 impl<T: SessionStream> SessionData<T> {
     pub async fn new(
         session: &Session<T>,
-        access_token: &AccessToken,
+        access_token: Arc<AccessToken>,
         in_flight: Option<InFlight>,
     ) -> trc::Result<Self> {
         let mut session = SessionData {
             stream_tx: session.stream_tx.clone(),
-            jmap: session.jmap.clone(),
-            imap: session.imap.clone(),
+            server: session.server.clone(),
             account_id: access_token.primary_id(),
             session_id: session.session_id,
             mailboxes: Mutex::new(vec![]),
             state: access_token.state().into(),
+            access_token,
             in_flight,
         };
+        let access_token = session.access_token.clone();
 
         // Fetch mailboxes for the main account
         let mut mailboxes = vec![session
-            .fetch_account_mailboxes(session.account_id, None, access_token)
+            .fetch_account_mailboxes(session.account_id, None, &access_token)
             .await
             .caused_by(trc::location!())?];
 
@@ -56,20 +61,20 @@ impl<T: SessionStream> SessionData<T> {
                         account_id,
                         format!(
                             "{}/{}",
-                            session.jmap.core.jmap.shared_folder,
+                            session.server.core.jmap.shared_folder,
                             session
-                                .jmap
+                                .server
                                 .core
                                 .storage
                                 .directory
                                 .query(QueryBy::Id(account_id), false)
                                 .await
                                 .unwrap_or_default()
-                                .map(|p| p.name)
+                                .and_then(|mut p| p.take_str(PrincipalField::Name))
                                 .unwrap_or_else(|| Id::from(account_id).to_string())
                         )
                         .into(),
-                        access_token,
+                        &access_token,
                     )
                     .await
                     .caused_by(trc::location!())?,
@@ -88,7 +93,7 @@ impl<T: SessionStream> SessionData<T> {
         access_token: &AccessToken,
     ) -> trc::Result<Account> {
         let state_mailbox = self
-            .jmap
+            .server
             .core
             .storage
             .data
@@ -96,7 +101,7 @@ impl<T: SessionStream> SessionData<T> {
             .await
             .caused_by(trc::location!())?;
         let state_email = self
-            .jmap
+            .server
             .core
             .storage
             .data
@@ -107,19 +112,21 @@ impl<T: SessionStream> SessionData<T> {
             account_id,
             primary_id: access_token.primary_id(),
         };
-        if let Some(cached_account) =
-            self.imap
-                .cache_account
-                .get(&cached_account_id)
-                .and_then(|cached_account| {
-                    if cached_account.state_mailbox == state_mailbox
-                        && cached_account.state_email == state_email
-                    {
-                        Some(cached_account)
-                    } else {
-                        None
-                    }
-                })
+        if let Some(cached_account) = self
+            .server
+            .inner
+            .data
+            .account_cache
+            .get(&cached_account_id)
+            .and_then(|cached_account| {
+                if cached_account.state_mailbox == state_mailbox
+                    && cached_account.state_email == state_email
+                {
+                    Some(cached_account)
+                } else {
+                    None
+                }
+            })
         {
             return Ok(cached_account.as_ref().clone());
         }
@@ -127,12 +134,12 @@ impl<T: SessionStream> SessionData<T> {
         let mailbox_ids = if access_token.is_primary_id(account_id)
             || access_token.member_of.contains(&account_id)
         {
-            self.jmap
+            self.server
                 .mailbox_get_or_create(account_id)
                 .await
                 .caused_by(trc::location!())?
         } else {
-            self.jmap
+            self.server
                 .shared_documents(access_token, account_id, Collection::Mailbox, Acl::Read)
                 .await
                 .caused_by(trc::location!())?
@@ -142,7 +149,7 @@ impl<T: SessionStream> SessionData<T> {
         let mut mailboxes = Vec::with_capacity(10);
         let mut special_uses = AHashMap::new();
         for (mailbox_id, values) in self
-            .jmap
+            .server
             .get_properties::<Object<Value>, _, _>(
                 account_id,
                 Collection::Mailbox,
@@ -189,7 +196,7 @@ impl<T: SessionStream> SessionData<T> {
         let mut path = Vec::new();
         let mut iter_stack = Vec::new();
         let message_ids = self
-            .jmap
+            .server
             .get_document_ids(account_id, Collection::Email)
             .await
             .caused_by(trc::location!())?;
@@ -246,7 +253,7 @@ impl<T: SessionStream> SessionData<T> {
                                 },
                             ),
                             total_messages: self
-                                .jmap
+                                .server
                                 .get_tag(
                                     account_id,
                                     Collection::Email,
@@ -259,7 +266,7 @@ impl<T: SessionStream> SessionData<T> {
                                 .unwrap_or(0)
                                 .into(),
                             total_unseen: self
-                                .jmap
+                                .server
                                 .mailbox_unread_tags(account_id, *mailbox_id, &message_ids)
                                 .await
                                 .caused_by(trc::location!())?
@@ -278,7 +285,7 @@ impl<T: SessionStream> SessionData<T> {
 
                     // Map special use folder aliases to their internal ids
                     let effective_mailbox_id = self
-                        .jmap
+                        .server
                         .core
                         .jmap
                         .default_folders
@@ -313,8 +320,10 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         // Update cache
-        self.imap
-            .cache_account
+        self.server
+            .inner
+            .data
+            .account_cache
             .insert(cached_account_id, Arc::new(account.clone()));
 
         Ok(account)
@@ -332,7 +341,7 @@ impl<T: SessionStream> SessionData<T> {
 
         // Obtain access token
         let access_token = self
-            .jmap
+            .server
             .get_cached_access_token(self.account_id)
             .await
             .caused_by(trc::location!())?;
@@ -382,15 +391,15 @@ impl<T: SessionStream> SessionData<T> {
             for account_id in added_account_ids {
                 let prefix = format!(
                     "{}/{}",
-                    self.jmap.core.jmap.shared_folder,
-                    self.jmap
+                    self.server.core.jmap.shared_folder,
+                    self.server
                         .core
                         .storage
                         .directory
                         .query(QueryBy::Id(account_id), false)
                         .await
-                        .unwrap_or_default()
-                        .map(|p| p.name)
+                        .caused_by(trc::location!())?
+                        .and_then(|mut p| p.take_str(PrincipalField::Name))
                         .unwrap_or_else(|| Id::from(account_id).to_string())
                 );
                 added_accounts.push(
@@ -413,7 +422,7 @@ impl<T: SessionStream> SessionData<T> {
             .collect::<Vec<_>>();
         for (account_id, last_state) in account_states {
             let changelog = self
-                .jmap
+                .server
                 .changes_(
                     account_id,
                     Collection::Mailbox,
@@ -436,7 +445,7 @@ impl<T: SessionStream> SessionData<T> {
                 if has_child_changes && !has_changes && changes.is_none() {
                     // Only child changes, no need to re-fetch mailboxes
                     let state_email = self
-                        .jmap
+                        .server
                         .core
                         .storage
                         .data
@@ -460,8 +469,13 @@ impl<T: SessionStream> SessionData<T> {
                     }
 
                     // Update cache
-                    if let Some(cached_account_) =
-                        self.imap.cache_account.lock().get_mut(&AccountId {
+                    if let Some(cached_account_) = self
+                        .server
+                        .inner
+                        .data
+                        .account_cache
+                        .lock()
+                        .get_mut(&AccountId {
                             account_id,
                             primary_id: access_token.primary_id(),
                         })
@@ -487,15 +501,15 @@ impl<T: SessionStream> SessionData<T> {
                     let mailbox_prefix = if !access_token.is_primary_id(account_id) {
                         format!(
                             "{}/{}",
-                            self.jmap.core.jmap.shared_folder,
-                            self.jmap
+                            self.server.core.jmap.shared_folder,
+                            self.server
                                 .core
                                 .storage
                                 .directory
                                 .query(QueryBy::Id(account_id), false)
                                 .await
                                 .caused_by(trc::location!())?
-                                .map(|p| p.name)
+                                .and_then(|mut p| p.take_str(PrincipalField::Name))
                                 .unwrap_or_else(|| Id::from(account_id).to_string())
                         )
                         .into()
@@ -612,7 +626,7 @@ impl<T: SessionStream> SessionData<T> {
         let access_token = self.get_access_token().await?;
         Ok(access_token.is_member(account_id)
             || self
-                .jmap
+                .server
                 .get_property::<Object<Value>>(
                     account_id,
                     Collection::Mailbox,

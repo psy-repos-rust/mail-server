@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::import::{ImportEmailRequest, ImportEmailResponse},
@@ -19,12 +20,25 @@ use jmap_proto::{
 use mail_parser::MessageParser;
 use utils::map::vec_map::VecMap;
 
-use crate::{api::http::HttpSessionData, auth::AccessToken, JMAP};
+use crate::{
+    api::http::HttpSessionData, auth::acl::AclMethods, blob::download::BlobDownload,
+    changes::state::StateManager, mailbox::set::MailboxSet, JmapMethods,
+};
 
-use super::ingest::{IngestEmail, IngestSource};
+use super::ingest::{EmailIngest, IngestEmail, IngestSource};
+use std::future::Future;
 
-impl JMAP {
-    pub async fn email_import(
+pub trait EmailImport: Sync + Send {
+    fn email_import(
+        &self,
+        request: ImportEmailRequest,
+        access_token: &AccessToken,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<ImportEmailResponse>> + Send;
+}
+
+impl EmailImport for Server {
+    async fn email_import(
         &self,
         request: ImportEmailRequest,
         access_token: &AccessToken,
@@ -46,7 +60,7 @@ impl JMAP {
         };
 
         // Obtain quota
-        let account_quota = self.get_quota(access_token, account_id).await?;
+        let resource_token = self.get_resource_token(access_token, account_id).await?;
 
         let mut response = ImportEmailResponse {
             account_id: request.account_id,
@@ -116,8 +130,7 @@ impl JMAP {
                 .email_ingest(IngestEmail {
                     raw_message: &raw_message,
                     message: MessageParser::new().parse(&raw_message),
-                    account_id,
-                    account_quota,
+                    resource: resource_token.clone(),
                     mailbox_ids,
                     keywords: email.keywords,
                     received_at: email.received_at.map(|r| r.into()),

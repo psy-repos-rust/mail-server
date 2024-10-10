@@ -5,11 +5,13 @@
  */
 
 use ahash::AHashSet;
-use directory::backend::internal::manage::ManageDirectory;
+use common::Server;
+use directory::{backend::internal::manage::ManageDirectory, QueryBy};
 use imap_proto::ResponseType;
 use jmap::{
+    email::delete::EmailDeletion,
     mailbox::{INBOX_ID, JUNK_ID, TRASH_ID},
-    JMAP,
+    JmapMethods,
 };
 use jmap_proto::types::{collection::Collection, id::Id, property::Property};
 use store::{
@@ -17,7 +19,11 @@ use store::{
     IterateParams, LogKey, U32_LEN, U64_LEN,
 };
 
-use crate::imap::{AssertResult, ImapConnection, Type};
+use crate::{
+    directory::internal::TestInternalDirectory,
+    imap::{AssertResult, ImapConnection, Type},
+    jmap::assert_is_empty,
+};
 
 use super::JMAPTest;
 
@@ -30,17 +36,18 @@ pub async fn test(params: &mut JMAPTest) {
     let junk_id = Id::from(JUNK_ID).to_string();
 
     // Connect to IMAP
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = server
         .core
         .storage
         .data
-        .get_or_create_account_id("jdoe@example.com")
-        .await
-        .unwrap();
+        .create_test_user(
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+            &["jdoe@example.com"],
+        )
+        .await;
+
     let mut imap = ImapConnection::connect(b"_x ").await;
     imap.assert_read(Type::Untagged, ResponseType::Ok).await;
     imap.send("LOGIN \"jdoe@example.com\" \"12345\"").await;
@@ -188,9 +195,19 @@ pub async fn test(params: &mut JMAPTest) {
             change
         );
     }
+
+    // Delete account
+    server
+        .core
+        .storage
+        .data
+        .delete_principal(QueryBy::Id(account_id))
+        .await
+        .unwrap();
+    assert_is_empty(server).await;
 }
 
-async fn get_changes(server: &JMAP) -> AHashSet<(u64, u8)> {
+async fn get_changes(server: &Server) -> AHashSet<(u64, u8)> {
     let mut changes = AHashSet::new();
     server
         .core

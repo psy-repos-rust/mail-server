@@ -6,18 +6,34 @@
 
 use std::fmt::Write;
 
-use common::manager::webadmin::Resource;
-use directory::QueryBy;
+use common::{manager::webadmin::Resource, Server};
+use directory::{backend::internal::PrincipalField, QueryBy};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use utils::url_params::UrlParams;
 
-use crate::{api::http::ToHttpResponse, JMAP};
+use crate::api::http::ToHttpResponse;
 
 use super::{HttpRequest, HttpResponse};
+use std::future::Future;
 
-impl JMAP {
-    pub async fn handle_autoconfig_request(&self, req: &HttpRequest) -> trc::Result<HttpResponse> {
+pub trait Autoconfig: Sync + Send {
+    fn handle_autoconfig_request(
+        &self,
+        req: &HttpRequest,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+    fn handle_autodiscover_request(
+        &self,
+        body: Option<Vec<u8>>,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+    fn autoconfig_parameters<'x>(
+        &self,
+        emailaddress: &'x str,
+    ) -> impl Future<Output = trc::Result<(String, String, &'x str)>> + Send;
+}
+
+impl Autoconfig for Server {
+    async fn handle_autoconfig_request(&self, req: &HttpRequest) -> trc::Result<HttpResponse> {
         // Obtain parameters
         let params = UrlParams::new(req.uri().query());
         let emailaddress = params
@@ -67,14 +83,13 @@ impl JMAP {
         );
         config.push_str("</clientConfig>\n");
 
-        Ok(Resource {
-            content_type: "application/xml; charset=utf-8",
-            contents: config.into_bytes(),
-        }
-        .into_http_response())
+        Ok(
+            Resource::new("application/xml; charset=utf-8", config.into_bytes())
+                .into_http_response(),
+        )
     }
 
-    pub async fn handle_autodiscover_request(
+    async fn handle_autodiscover_request(
         &self,
         body: Option<Vec<u8>>,
     ) -> trc::Result<HttpResponse> {
@@ -147,11 +162,10 @@ impl JMAP {
         let _ = writeln!(&mut config, "\t</Response>");
         let _ = writeln!(&mut config, "</Autodiscover>");
 
-        Ok(Resource {
-            content_type: "application/xml; charset=utf-8",
-            contents: config.into_bytes(),
-        }
-        .into_http_response())
+        Ok(
+            Resource::new("application/xml; charset=utf-8", config.into_bytes())
+                .into_http_response(),
+        )
     }
 
     async fn autoconfig_parameters<'x>(
@@ -187,14 +201,14 @@ impl JMAP {
             .await
             .unwrap_or_default()
         {
-            if let Ok(Some(principal)) = self
+            if let Ok(Some(mut principal)) = self
                 .core
                 .storage
                 .directory
                 .query(QueryBy::Id(id), false)
                 .await
             {
-                account_name = principal.name;
+                account_name = principal.take_str(PrincipalField::Name).unwrap_or_default();
                 break;
             }
         }

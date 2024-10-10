@@ -12,6 +12,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::{
     protocol::{
         thread::{Arguments, Response},
@@ -20,6 +21,7 @@ use imap_proto::{
     receiver::Request,
     Command, StatusResponse,
 };
+use jmap::email::cache::ThreadCache;
 use trc::AddContext;
 
 impl<T: SessionStream> Session<T> {
@@ -28,6 +30,9 @@ impl<T: SessionStream> Session<T> {
         request: Request<Command>,
         is_uid: bool,
     ) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapThread)?;
+
         let op_start = Instant::now();
         let command = request.command;
         let mut arguments = request.parse_thread()?;
@@ -76,7 +81,7 @@ impl<T: SessionStream> SessionData<T> {
 
         // Lock the cache
         let thread_ids = self
-            .jmap
+            .server
             .get_cached_thread_ids(mailbox.id.account_id, result_set.results.iter())
             .await
             .caused_by(trc::location!())?;

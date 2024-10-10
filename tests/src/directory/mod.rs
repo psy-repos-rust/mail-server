@@ -7,11 +7,15 @@
 pub mod imap;
 pub mod internal;
 pub mod ldap;
+pub mod oidc;
 pub mod smtp;
 pub mod sql;
 
-use common::{config::smtp::session::AddressMapping, Core};
-use directory::{backend::internal::manage::ManageDirectory, Directories};
+use common::{config::smtp::session::AddressMapping, Core, Server};
+use directory::{
+    backend::internal::{manage::ManageDirectory, PrincipalField},
+    Directories, Principal, Type,
+};
 use mail_send::Credentials;
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -241,6 +245,65 @@ name = "support"
 class = "group"
 description = "Support Team"
 
+##############################################################################
+
+[directory."oidc-userinfo"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/userinfo"
+endpoint.method = "userinfo"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-none"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-none"
+endpoint.method = "introspect"
+auth.method = "none"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-user-token"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-user-token"
+endpoint.method = "introspect"
+auth.method = "user-token"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-token"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-token"
+endpoint.method = "introspect"
+auth.method = "token"
+auth.token = "token_of_gratitude"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-basic"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-basic"
+endpoint.method = "introspect"
+auth.method = "basic"
+auth.username = "myuser"
+auth.secret = "mypass"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
 "#;
 
 pub struct DirectoryStore {
@@ -251,7 +314,21 @@ pub struct DirectoryTest {
     pub directories: Directories,
     pub stores: Stores,
     pub temp_dir: TempDir,
-    pub core: Core,
+    pub server: Server,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TestPrincipal {
+    pub id: u32,
+    pub typ: Type,
+    pub quota: u64,
+    pub name: String,
+    pub secrets: Vec<String>,
+    pub emails: Vec<String>,
+    pub member_of: Vec<String>,
+    pub roles: Vec<String>,
+    pub lists: Vec<String>,
+    pub description: Option<String>,
 }
 
 impl DirectoryTest {
@@ -282,6 +359,7 @@ impl DirectoryTest {
             id_store
                 .map(|id| stores.stores.get(id).unwrap().clone())
                 .unwrap_or_default(),
+            true,
         )
         .await;
         config.assert_no_errors();
@@ -295,7 +373,10 @@ impl DirectoryTest {
             directories,
             stores,
             temp_dir,
-            core,
+            server: Server {
+                inner: Default::default(),
+                core: core.into(),
+            },
         }
     }
 }
@@ -408,6 +489,64 @@ pub fn dummy_tls_acceptor() -> Arc<TlsAcceptor> {
     )))
 }
 
+trait IntoTestPrincipal {
+    fn into_test(self) -> TestPrincipal;
+}
+
+impl IntoTestPrincipal for Principal {
+    fn into_test(self) -> TestPrincipal {
+        TestPrincipal::from(self)
+    }
+}
+
+impl TestPrincipal {
+    pub fn into_sorted(mut self) -> Self {
+        self.member_of.sort_unstable();
+        self.emails.sort_unstable();
+        self
+    }
+}
+
+impl From<Principal> for TestPrincipal {
+    fn from(mut value: Principal) -> Self {
+        Self {
+            id: value.id(),
+            typ: value.typ(),
+            quota: value.quota(),
+            name: value.take_str(PrincipalField::Name).unwrap_or_default(),
+            secrets: value
+                .take_str_array(PrincipalField::Secrets)
+                .unwrap_or_default(),
+            emails: value
+                .take_str_array(PrincipalField::Emails)
+                .unwrap_or_default(),
+            member_of: value
+                .take_str_array(PrincipalField::MemberOf)
+                .unwrap_or_default(),
+            roles: value
+                .take_str_array(PrincipalField::Roles)
+                .unwrap_or_default(),
+            lists: value
+                .take_str_array(PrincipalField::Lists)
+                .unwrap_or_default(),
+            description: value.take_str(PrincipalField::Description),
+        }
+    }
+}
+
+impl From<TestPrincipal> for Principal {
+    fn from(value: TestPrincipal) -> Self {
+        Principal::new(value.id, value.typ)
+            .with_field(PrincipalField::Name, value.name)
+            .with_field(PrincipalField::Quota, value.quota)
+            .with_field(PrincipalField::Secrets, value.secrets)
+            .with_field(PrincipalField::Emails, value.emails)
+            .with_field(PrincipalField::MemberOf, value.member_of)
+            .with_field(PrincipalField::Lists, value.lists)
+            .with_opt_field(PrincipalField::Description, value.description)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Item {
     IsAccount(String),
@@ -500,92 +639,6 @@ impl core::fmt::Debug for Item {
     }
 }
 
-/*
-
-// DEPRECATED - TODO: Remove
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn lookup_local() {
-    const LOOKUP_CONFIG: &str = r#"
-    [store."local/regex"]
-    type = "memory"
-    format = "regex"
-    values = ["^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$",
-             "^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"]
-
-    [store."local/glob"]
-    type = "memory"
-    format = "glob"
-    values = ["*@example.org", "test@*", "localhost", "*+*@*.domain.net"]
-
-    [store."local/list"]
-    type = "memory"
-    format = "list"
-    values = ["abc", "xyz", "123"]
-
-    [store."local/suffix"]
-    type = "memory"
-    format = "glob"
-    comment = "//"
-    values = ["https://publicsuffix.org/list/public_suffix_list.dat", "fallback+file://%PATH%/public_suffix_list.dat.gz"]
-    "#;
-
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
-
-    let mut config = utils::config::Config::new(
-        &LOOKUP_CONFIG.replace(
-            "%PATH%",
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .to_path_buf()
-                .join("resources")
-                .join("config")
-                .join("lists")
-                .to_str()
-                .unwrap(),
-        ),
-    )
-    .unwrap();
-
-    let lookups = Stores::parse_all(&mut config).await.lookup_stores;
-
-    for (lookup, item, expect) in [
-        ("glob", "user@example.org", true),
-        ("glob", "test@otherdomain.org", true),
-        ("glob", "localhost", true),
-        ("glob", "john+doe@doefamily.domain.net", true),
-        ("glob", "john@domain.net", false),
-        ("glob", "example.org", false),
-        ("list", "abc", true),
-        ("list", "xyz", true),
-        ("list", "zzz", false),
-        ("regex", "user@domain.com", true),
-        ("regex", "127.0.0.1", true),
-        ("regex", "hello", false),
-        ("suffix", "co.uk", true),
-        ("suffix", "coco", false),
-    ] {
-        assert_eq!(
-            lookups
-                .get(&format!("local/{lookup}"))
-                .unwrap()
-                .key_get::<String>(item.as_bytes().to_vec())
-                .await
-                .unwrap()
-                .is_some(),
-            expect,
-            "failed for {lookup}, item {item}"
-        );
-    }
-}
-*/
-
 #[tokio::test]
 async fn address_mappings() {
     const MAPPINGS: &str = r#"
@@ -614,7 +667,7 @@ async fn address_mappings() {
     let mut config = utils::config::Config::new(MAPPINGS).unwrap();
     const ADDR: &str = "john.doe+alias@example.org";
     const ADDR_NO_MATCH: &str = "jane@example.org";
-    let core = Core::default();
+    let core = Server::default();
 
     for test in ["enable", "disable", "custom"] {
         let catch_all = AddressMapping::parse(&mut config, (test, "catch-all"));
@@ -648,7 +701,13 @@ async fn address_mappings() {
 async fn map_account_ids(store: &Store, names: Vec<impl AsRef<str>>) -> Vec<u32> {
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
-        ids.push(store.get_account_id(name.as_ref()).await.unwrap().unwrap());
+        ids.push(
+            store
+                .get_principal_id(name.as_ref())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
     }
     ids
 }

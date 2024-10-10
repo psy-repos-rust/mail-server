@@ -5,7 +5,7 @@
  */
 
 use ahash::AHashSet;
-use common::Core;
+use common::{manager::backup::BackupParams, Core};
 use jmap_proto::types::{collection::Collection, property::Property};
 use store::{
     rand,
@@ -204,12 +204,6 @@ pub async fn test(db: Store) {
                 random_bytes(4),
             )
             .set(
-                ValueClass::Directory(DirectoryClass::Domain(random_bytes(
-                    4 + account_id as usize,
-                ))),
-                random_bytes(4),
-            )
-            .set(
                 ValueClass::Directory(DirectoryClass::Principal(MaybeDynamicId::Static(
                     account_id,
                 ))),
@@ -240,7 +234,7 @@ pub async fn test(db: Store) {
     // Export store
     println!("Exporting store...");
     let temp_dir = TempDir::new("art_vandelay_tests", true);
-    core.backup(temp_dir.path.clone()).await;
+    core.backup(BackupParams::new(temp_dir.path.clone())).await;
 
     // Destroy store
     println!("Destroying store...");

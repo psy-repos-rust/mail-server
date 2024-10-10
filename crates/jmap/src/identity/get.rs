@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::QueryBy;
+use common::Server;
+use directory::{backend::internal::PrincipalField, QueryBy};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
@@ -16,12 +17,25 @@ use store::{
 };
 use trc::AddContext;
 
-use crate::JMAP;
+use crate::{changes::state::StateManager, JmapMethods};
 
 use super::set::sanitize_email;
+use std::future::Future;
 
-impl JMAP {
-    pub async fn identity_get(
+pub trait IdentityGet: Sync + Send {
+    fn identity_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+
+    fn identity_get_or_create(
+        &self,
+        account_id: u32,
+    ) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
+}
+
+impl IdentityGet for Server {
+    async fn identity_get(
         &self,
         mut request: GetRequest<RequestArguments>,
     ) -> trc::Result<GetResponse> {
@@ -107,7 +121,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn identity_get_or_create(&self, account_id: u32) -> trc::Result<RoaringBitmap> {
+    async fn identity_get_or_create(&self, account_id: u32) -> trc::Result<RoaringBitmap> {
         let mut identity_ids = self
             .get_document_ids(account_id, Collection::Identity)
             .await?
@@ -125,7 +139,8 @@ impl JMAP {
             .await
             .caused_by(trc::location!())?
             .unwrap_or_default();
-        if principal.emails.is_empty() {
+        let num_emails = principal.field_len(PrincipalField::Emails);
+        if num_emails == 0 {
             return Ok(identity_ids);
         }
 
@@ -136,14 +151,14 @@ impl JMAP {
 
         // Create identities
         let name = principal
-            .description
-            .unwrap_or(principal.name)
+            .description()
+            .unwrap_or(principal.name())
             .trim()
             .to_string();
-        let has_many = principal.emails.len() > 1;
-        for (idx, email) in principal.emails.into_iter().enumerate() {
+        let has_many = num_emails > 1;
+        for (idx, email) in principal.iter_str(PrincipalField::Emails).enumerate() {
             let document_id = idx as u32;
-            let email = sanitize_email(&email).unwrap_or_default();
+            let email = sanitize_email(email).unwrap_or_default();
             if email.is_empty() {
                 continue;
             }

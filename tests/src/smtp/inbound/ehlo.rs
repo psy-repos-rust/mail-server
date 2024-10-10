@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use common::Core;
 use mail_auth::{common::parse::TxtRecordParser, spf::Spf, SpfResult};
 
-use smtp::core::{Inner, Session};
+use smtp::core::Session;
 use utils::config::Config;
 
 use crate::smtp::{
-    build_smtp,
     session::{TestSession, VerifyResponse},
+    TestSMTP,
 };
 
 const CONFIG: &str = r#"
@@ -38,8 +38,8 @@ ehlo = [{if = "remote_ip = '10.0.0.2'", then = 'strict'},
 
 #[tokio::test]
 async fn ehlo() {
-        // Enable logging
-        crate::enable_logging();
+    // Enable logging
+    crate::enable_logging();
 
     let mut config = Config::new(CONFIG).unwrap();
     let core = Core::parse(&mut config, Default::default(), Default::default()).await;
@@ -55,7 +55,7 @@ async fn ehlo() {
     );
 
     // Reject non-FQDN domains
-    let mut session = Session::test(build_smtp(core, Inner::default()));
+    let mut session = Session::test(TestSMTP::from_core(core).server);
     session.data.remote_ip_str = "10.0.0.1".to_string();
     session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
     session.stream.tls = false;

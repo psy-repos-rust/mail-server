@@ -77,25 +77,23 @@ impl<T: SessionStream> Session<T> {
 
         // Address rewriting and Sieve filtering
         let rcpt_script = self
-            .core
-            .core
+            .server
             .eval_if::<String, _>(
-                &self.core.core.smtp.session.rcpt.script,
+                &self.server.core.smtp.session.rcpt.script,
                 self,
                 self.data.session_id,
             )
             .await
             .and_then(|name| {
-                self.core
-                    .core
+                self.server
                     .get_trusted_sieve_script(&name, self.data.session_id)
                     .map(|s| (s.clone(), name))
             });
 
         if rcpt_script.is_some()
-            || !self.core.core.smtp.session.rcpt.rewrite.is_empty()
+            || !self.server.core.smtp.session.rcpt.rewrite.is_empty()
             || self
-                .core
+                .server
                 .core
                 .smtp
                 .session
@@ -146,10 +144,9 @@ impl<T: SessionStream> Session<T> {
 
             // Address rewriting
             if let Some(new_address) = self
-                .core
-                .core
+                .server
                 .eval_if::<String, _>(
-                    &self.core.core.smtp.session.rcpt.rewrite,
+                    &self.server.core.smtp.session.rcpt.rewrite,
                     self,
                     self.data.session_id,
                 )
@@ -187,22 +184,20 @@ impl<T: SessionStream> Session<T> {
         // Verify address
         let rcpt = self.data.rcpt_to.last().unwrap();
         if let Some(directory) = self
-            .core
-            .core
+            .server
             .eval_if::<String, _>(
-                &self.core.core.smtp.session.rcpt.directory,
+                &self.server.core.smtp.session.rcpt.directory,
                 self,
                 self.data.session_id,
             )
             .await
-            .and_then(|name| self.core.core.get_directory(&name))
+            .and_then(|name| self.server.get_directory(&name))
         {
             match directory.is_local_domain(&rcpt.domain).await {
                 Ok(is_local_domain) => {
                     if is_local_domain {
                         match self
-                            .core
-                            .core
+                            .server
                             .rcpt(directory, &rcpt.address_lcase, self.data.session_id)
                             .await
                         {
@@ -214,9 +209,12 @@ impl<T: SessionStream> Session<T> {
                                         To = rcpt.address_lcase.clone(),
                                     );
 
-                                    self.data.rcpt_to.pop();
+                                    let rcpt_to = self.data.rcpt_to.pop().unwrap().address_lcase;
                                     return self
-                                        .rcpt_error(b"550 5.1.2 Mailbox does not exist.\r\n")
+                                        .rcpt_error(
+                                            b"550 5.1.2 Mailbox does not exist.\r\n",
+                                            rcpt_to,
+                                        )
                                         .await;
                                 }
                             }
@@ -233,10 +231,9 @@ impl<T: SessionStream> Session<T> {
                             }
                         }
                     } else if !self
-                        .core
-                        .core
+                        .server
                         .eval_if(
-                            &self.core.core.smtp.session.rcpt.relay,
+                            &self.server.core.smtp.session.rcpt.relay,
                             self,
                             self.data.session_id,
                         )
@@ -249,8 +246,10 @@ impl<T: SessionStream> Session<T> {
                             To = rcpt.address_lcase.clone(),
                         );
 
-                        self.data.rcpt_to.pop();
-                        return self.rcpt_error(b"550 5.1.2 Relay not allowed.\r\n").await;
+                        let rcpt_to = self.data.rcpt_to.pop().unwrap().address_lcase;
+                        return self
+                            .rcpt_error(b"550 5.1.2 Relay not allowed.\r\n", rcpt_to)
+                            .await;
                     }
                 }
                 Err(err) => {
@@ -266,10 +265,9 @@ impl<T: SessionStream> Session<T> {
                 }
             }
         } else if !self
-            .core
-            .core
+            .server
             .eval_if(
-                &self.core.core.smtp.session.rcpt.relay,
+                &self.server.core.smtp.session.rcpt.relay,
                 self,
                 self.data.session_id,
             )
@@ -282,8 +280,10 @@ impl<T: SessionStream> Session<T> {
                 To = rcpt.address_lcase.clone(),
             );
 
-            self.data.rcpt_to.pop();
-            return self.rcpt_error(b"550 5.1.2 Relay not allowed.\r\n").await;
+            let rcpt_to = self.data.rcpt_to.pop().unwrap().address_lcase;
+            return self
+                .rcpt_error(b"550 5.1.2 Relay not allowed.\r\n", rcpt_to)
+                .await;
         }
 
         if self.is_allowed().await {
@@ -308,41 +308,45 @@ impl<T: SessionStream> Session<T> {
         self.write(b"250 2.1.5 OK\r\n").await
     }
 
-    async fn rcpt_error(&mut self, response: &[u8]) -> Result<(), ()> {
+    async fn rcpt_error(&mut self, response: &[u8], rcpt: String) -> Result<(), ()> {
         tokio::time::sleep(self.params.rcpt_errors_wait).await;
         self.data.rcpt_errors += 1;
-        self.write(response).await?;
-        if self.data.rcpt_errors < self.params.rcpt_errors_max {
-            Ok(())
-        } else {
-            match self
-                .core
-                .core
-                .is_rcpt_fail2banned(self.data.remote_ip)
-                .await
-            {
-                Ok(true) => {
-                    trc::event!(
-                        Security(SecurityEvent::BruteForceBan),
-                        SpanId = self.data.session_id,
-                        RemoteIp = self.data.remote_ip,
-                    );
-                }
-                Ok(false) => {
+        let has_too_many_errors = self.data.rcpt_errors >= self.params.rcpt_errors_max;
+
+        match self
+            .server
+            .is_rcpt_fail2banned(self.data.remote_ip, &rcpt)
+            .await
+        {
+            Ok(true) => {
+                trc::event!(
+                    Security(SecurityEvent::AbuseBan),
+                    SpanId = self.data.session_id,
+                    RemoteIp = self.data.remote_ip,
+                    To = rcpt,
+                );
+            }
+            Ok(false) => {
+                if has_too_many_errors {
                     trc::event!(
                         Smtp(SmtpEvent::TooManyInvalidRcpt),
                         SpanId = self.data.session_id,
                         Limit = self.params.rcpt_errors_max,
+                        To = rcpt,
                     );
                 }
-                Err(err) => {
-                    trc::error!(err
-                        .span_id(self.data.session_id)
-                        .caused_by(trc::location!())
-                        .details("Failed to check if IP should be banned."));
-                }
             }
+            Err(err) => {
+                trc::error!(err
+                    .span_id(self.data.session_id)
+                    .caused_by(trc::location!())
+                    .details("Failed to check if IP should be banned."));
+            }
+        }
 
+        if !has_too_many_errors {
+            self.write(response).await
+        } else {
             self.write(b"421 4.3.0 Too many errors, disconnecting.\r\n")
                 .await?;
             Err(())

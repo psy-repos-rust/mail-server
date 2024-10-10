@@ -11,16 +11,15 @@ pub mod ping;
 pub mod request;
 pub mod spawn;
 
+use common::Inner;
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
     time::Instant,
 };
 use tokio::sync::mpsc;
 use trc::ClusterEvent;
-
-use crate::JmapInstance;
 
 use self::request::Request;
 
@@ -44,7 +43,7 @@ pub struct Gossiper {
     pub last_peer_pinged: usize,
 
     // IPC
-    pub core: JmapInstance,
+    pub inner: Arc<Inner>,
     pub gossip_tx: mpsc::Sender<(SocketAddr, Request)>,
 }
 
@@ -66,6 +65,7 @@ pub struct Peer {
     pub epoch: EpochId,
     pub gen_config: GenerationId,
     pub gen_lists: GenerationId,
+    pub gen_permissions: GenerationId,
     pub state: State,
 
     // Heartbeat state
@@ -83,6 +83,7 @@ pub struct PeerStatus {
     pub epoch: EpochId,
     pub gen_config: GenerationId,
     pub gen_lists: GenerationId,
+    pub gen_permissions: GenerationId,
 }
 
 impl From<&Peer> for PeerStatus {
@@ -92,6 +93,7 @@ impl From<&Peer> for PeerStatus {
             epoch: peer.epoch,
             gen_config: peer.gen_config,
             gen_lists: peer.gen_lists,
+            gen_permissions: peer.gen_permissions,
         }
     }
 }
@@ -101,25 +103,23 @@ impl From<&Gossiper> for PeerStatus {
         PeerStatus {
             addr: cluster.addr,
             epoch: cluster.epoch,
-            gen_config: cluster
-                .core
-                .jmap_inner
-                .config_version
-                .load(Ordering::Relaxed),
+            gen_config: cluster.inner.data.config_version.load(Ordering::Relaxed),
             gen_lists: cluster
-                .core
-                .core
-                .load()
-                .network
-                .blocked_ips
-                .version
+                .inner
+                .data
+                .blocked_ips_version
+                .load(Ordering::Relaxed),
+            gen_permissions: cluster
+                .inner
+                .data
+                .permissions_version
                 .load(Ordering::Relaxed),
         }
     }
 }
 
 impl Gossiper {
-    pub async fn send_gossip(&self, dest: IpAddr, request: Request) {
+    async fn send_gossip(&self, dest: IpAddr, request: Request) {
         if let Err(err) = self
             .gossip_tx
             .send((SocketAddr::new(dest, self.port), request))

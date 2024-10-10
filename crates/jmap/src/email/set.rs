@@ -6,6 +6,7 @@
 
 use std::{borrow::Cow, collections::HashMap, slice::IterMut};
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::set::{RequestArguments, SetRequest, SetResponse},
@@ -40,15 +41,33 @@ use store::{
 };
 use trc::AddContext;
 
-use crate::{api::http::HttpSessionData, auth::AccessToken, mailbox::UidMailbox, JMAP};
+use crate::{
+    api::http::HttpSessionData,
+    auth::acl::AclMethods,
+    blob::download::BlobDownload,
+    changes::{state::StateManager, write::ChangeLog},
+    mailbox::{set::MailboxSet, UidMailbox},
+    JmapMethods,
+};
+use std::future::Future;
 
 use super::{
+    delete::EmailDeletion,
     headers::{BuildHeader, ValueToHeader},
-    ingest::{IngestEmail, IngestSource},
+    ingest::{EmailIngest, IngestEmail, IngestSource},
 };
 
-impl JMAP {
-    pub async fn email_set(
+pub trait EmailSet: Sync + Send {
+    fn email_set(
+        &self,
+        request: SetRequest<RequestArguments>,
+        access_token: &AccessToken,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+}
+
+impl EmailSet for Server {
+    async fn email_set(
         &self,
         mut request: SetRequest<RequestArguments>,
         access_token: &AccessToken,
@@ -88,7 +107,7 @@ impl JMAP {
         let will_destroy = request.unwrap_destroy();
 
         // Obtain quota
-        let account_quota = self.get_quota(access_token, account_id).await?;
+        let resource_token = self.get_resource_token(access_token, account_id).await?;
 
         // Process creates
         'create: for (id, mut object) in request.unwrap_create() {
@@ -714,8 +733,7 @@ impl JMAP {
                 .email_ingest(IngestEmail {
                     raw_message: &raw_message,
                     message: MessageParser::new().parse(&raw_message),
-                    account_id,
-                    account_quota,
+                    resource: resource_token.clone(),
                     mailbox_ids: mailboxes,
                     keywords,
                     received_at,

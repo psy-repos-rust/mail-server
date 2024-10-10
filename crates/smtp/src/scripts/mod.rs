@@ -7,7 +7,9 @@
 use std::borrow::Cow;
 
 use ahash::AHashMap;
-use common::{expr::functions::ResolveVariable, scripts::ScriptModification, Core};
+use common::{
+    auth::AccessToken, expr::functions::ResolveVariable, scripts::ScriptModification, Server,
+};
 use sieve::{runtime::Variable, Envelope};
 
 pub mod envelope;
@@ -38,6 +40,8 @@ pub struct ScriptParameters<'x> {
     sign: Vec<String>,
     #[cfg(feature = "test_mode")]
     expected_variables: Option<AHashMap<String, Variable>>,
+    access_token: Option<&'x AccessToken>,
+    session_id: u64,
 }
 
 impl<'x> ScriptParameters<'x> {
@@ -53,25 +57,30 @@ impl<'x> ScriptParameters<'x> {
             from_name: Default::default(),
             return_path: Default::default(),
             sign: Default::default(),
+            access_token: None,
+            session_id: Default::default(),
         }
     }
 
     pub async fn with_envelope(
         mut self,
-        core: &Core,
+        server: &Server,
         vars: &impl ResolveVariable,
         session_id: u64,
     ) -> Self {
         for (variable, expr) in [
-            (&mut self.from_addr, &core.sieve.from_addr),
-            (&mut self.from_name, &core.sieve.from_name),
-            (&mut self.return_path, &core.sieve.return_path),
+            (&mut self.from_addr, &server.core.sieve.from_addr),
+            (&mut self.from_name, &server.core.sieve.from_name),
+            (&mut self.return_path, &server.core.sieve.return_path),
         ] {
-            if let Some(value) = core.eval_if(expr, vars, session_id).await {
+            if let Some(value) = server.eval_if(expr, vars, session_id).await {
                 *variable = value;
             }
         }
-        if let Some(value) = core.eval_if(&core.sieve.sign, vars, session_id).await {
+        if let Some(value) = server
+            .eval_if(&server.core.sieve.sign, vars, session_id)
+            .await
+        {
             self.sign = value;
         }
         self
@@ -102,6 +111,16 @@ impl<'x> ScriptParameters<'x> {
 
     pub fn set_envelope(mut self, envelope: Envelope, value: impl Into<Variable>) -> Self {
         self.envelope.push((envelope, value.into()));
+        self
+    }
+
+    pub fn with_access_token(mut self, access_token: &'x AccessToken) -> Self {
+        self.access_token = Some(access_token);
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: u64) -> Self {
+        self.session_id = session_id;
         self
     }
 

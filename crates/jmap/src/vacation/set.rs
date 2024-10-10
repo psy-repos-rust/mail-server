@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::set::{RequestArguments, SetRequest, SetResponse},
@@ -21,6 +22,7 @@ use jmap_proto::{
 };
 use mail_builder::MessageBuilder;
 use mail_parser::decoders::html::html_to_text;
+use std::future::Future;
 use store::write::{
     assert::HashedValue,
     log::{Changes, LogInsert},
@@ -28,20 +30,36 @@ use store::write::{
 };
 
 use crate::{
-    sieve::set::{ObjectBlobId, SCHEMA},
-    JMAP,
+    blob::upload::BlobUpload,
+    changes::write::ChangeLog,
+    sieve::set::{ObjectBlobId, SieveScriptSet, SCHEMA},
+    JmapMethods,
 };
 
-impl JMAP {
-    pub async fn vacation_response_set(
+use super::get::VacationResponseGet;
+
+pub trait VacationResponseSet: Sync + Send {
+    fn vacation_response_set(
+        &self,
+        request: SetRequest<RequestArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+
+    fn build_script(&self, obj: &mut ObjectIndexBuilder) -> trc::Result<Vec<u8>>;
+}
+
+impl VacationResponseSet for Server {
+    async fn vacation_response_set(
         &self,
         mut request: SetRequest<RequestArguments>,
+        access_token: &AccessToken,
     ) -> trc::Result<SetResponse> {
         let account_id = request.account_id.document_id();
         let mut response = self
             .prepare_set_response(&request, Collection::SieveScript)
             .await?;
         let will_destroy = request.unwrap_destroy();
+        let resource_token = self.get_resource_token(access_token, account_id).await?;
 
         // Process set or update requests
         let mut create_id = None;
@@ -197,10 +215,9 @@ impl JMAP {
                         Property::Value,
                     )
                     .await?
-                    .map(|value| {
+                    .inspect(|value| {
                         was_active = value.inner.properties.get(&Property::IsActive)
                             == Some(&Value::Bool(true));
-                        value
                     })
                     .ok_or_else(|| {
                         trc::StoreEvent::NotFound
@@ -232,11 +249,6 @@ impl JMAP {
                     .hash;
                 let blob_id = obj.changes_mut().unwrap().blob_id_mut().unwrap();
                 blob_id.hash = hash;
-                /*blob_id.class = BlobClass::Linked {
-                    account_id,
-                    collection: Collection::SieveScript.into(),
-                    document_id: u32::MAX,
-                };*/
 
                 // Link blob
                 batch.set(
@@ -270,9 +282,25 @@ impl JMAP {
                     };
                     if quota != 0 {
                         batch.add(DirectoryClass::UsedQuota(account_id), quota);
+
+                        // Update tenant quota
+                        #[cfg(feature = "enterprise")]
+                        if self.core.is_enterprise_edition() {
+                            if let Some(tenant) = resource_token.tenant {
+                                batch.add(DirectoryClass::UsedQuota(tenant.id), quota);
+                            }
+                        }
                     }
                 } else {
                     batch.add(DirectoryClass::UsedQuota(account_id), script_size);
+
+                    // Update tenant quota
+                    #[cfg(feature = "enterprise")]
+                    if self.core.is_enterprise_edition() {
+                        if let Some(tenant) = resource_token.tenant {
+                            batch.add(DirectoryClass::UsedQuota(tenant.id), script_size);
+                        }
+                    }
                 }
             };
 
@@ -309,7 +337,7 @@ impl JMAP {
                 if id.is_singleton() {
                     if let Some(document_id) = self.get_vacation_sieve_script_id(account_id).await?
                     {
-                        self.sieve_script_delete(account_id, document_id, false)
+                        self.sieve_script_delete(&resource_token, document_id, false)
                             .await?;
                         batch.log(Changes::delete([document_id]));
                         response.destroyed.push(id);

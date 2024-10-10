@@ -6,12 +6,15 @@
 
 use std::{iter::Peekable, sync::Arc, vec::IntoIter};
 
-use common::listener::{limiter::ConcurrencyLimiter, SessionResult, SessionStream};
+use common::{
+    listener::{limiter::ConcurrencyLimiter, SessionResult, SessionStream},
+    ConcurrencyLimiters,
+};
 use imap_proto::{
     receiver::{self, Request},
     Command, ResponseType, StatusResponse,
 };
-use jmap::auth::rate_limit::ConcurrencyLimiters;
+use trc::SecurityEvent;
 
 use super::{SelectedMailbox, Session, SessionData, State};
 
@@ -48,6 +51,34 @@ impl<T: SessionStream> Session<T> {
                     break;
                 }
                 Err(receiver::Error::Error { response }) => {
+                    // Check for port scanners
+                    if matches!(
+                        (&self.state, response.key(trc::Key::Code)),
+                        (
+                            State::NotAuthenticated { .. },
+                            Some(trc::Value::Static("PARSE"))
+                        )
+                    ) {
+                        match self.server.is_scanner_fail2banned(self.remote_addr).await {
+                            Ok(true) => {
+                                trc::event!(
+                                    Security(SecurityEvent::ScanBan),
+                                    SpanId = self.session_id,
+                                    RemoteIp = self.remote_addr,
+                                    Reason = "Invalid IMAP command",
+                                );
+
+                                return SessionResult::Close;
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                trc::error!(err
+                                    .span_id(self.session_id)
+                                    .details("Failed to check for fail2ban"));
+                            }
+                        }
+                    }
+
                     if !self.write_error(response).await {
                         return SessionResult::Close;
                     }
@@ -255,9 +286,9 @@ impl<T: SessionStream> Session<T> {
         let state = &self.state;
         // Rate limit request
         if let State::Authenticated { data } | State::Selected { data, .. } = state {
-            if let Some(rate) = &self.jmap.core.imap.rate_requests {
+            if let Some(rate) = &self.server.core.imap.rate_requests {
                 if data
-                    .jmap
+                    .server
                     .core
                     .storage
                     .lookup
@@ -301,7 +332,7 @@ impl<T: SessionStream> Session<T> {
             }
             Command::Login => {
                 if let State::NotAuthenticated { .. } = state {
-                    if self.is_tls || self.jmap.core.imap.allow_plain_auth {
+                    if self.is_tls || self.server.core.imap.allow_plain_auth {
                         Ok(request)
                     } else {
                         Err(trc::ImapEvent::Error
@@ -385,9 +416,11 @@ impl<T: SessionStream> Session<T> {
     }
 
     pub fn get_concurrency_limiter(&self, account_id: u32) -> Option<Arc<ConcurrencyLimiters>> {
-        let rate = self.jmap.core.imap.rate_concurrent?;
-        self.imap
-            .rate_limiter
+        let rate = self.server.core.imap.rate_concurrent?;
+        self.server
+            .inner
+            .data
+            .imap_limiter
             .get(&account_id)
             .map(|limiter| limiter.clone())
             .unwrap_or_else(|| {
@@ -395,7 +428,11 @@ impl<T: SessionStream> Session<T> {
                     concurrent_requests: ConcurrencyLimiter::new(rate),
                     concurrent_uploads: ConcurrencyLimiter::new(rate),
                 });
-                self.imap.rate_limiter.insert(account_id, limiter.clone());
+                self.server
+                    .inner
+                    .data
+                    .imap_limiter
+                    .insert(account_id, limiter.clone());
                 limiter
             })
             .into()

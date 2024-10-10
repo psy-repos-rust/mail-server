@@ -9,7 +9,7 @@ use imap_proto::receiver::{self, Request};
 use jmap_proto::types::{collection::Collection, property::Property};
 use store::query::Filter;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use trc::AddContext;
+use trc::{AddContext, SecurityEvent};
 
 use super::{Command, ResponseCode, SerializeResponse, Session, State};
 
@@ -46,6 +46,34 @@ impl<T: SessionStream> Session<T> {
                     break;
                 }
                 Err(receiver::Error::Error { response }) => {
+                    // Check for port scanners
+                    if matches!(
+                        (&self.state, response.key(trc::Key::Code)),
+                        (
+                            State::NotAuthenticated { .. },
+                            Some(trc::Value::Static("PARSE"))
+                        )
+                    ) {
+                        match self.server.is_scanner_fail2banned(self.remote_addr).await {
+                            Ok(true) => {
+                                trc::event!(
+                                    Security(SecurityEvent::ScanBan),
+                                    SpanId = self.session_id,
+                                    RemoteIp = self.remote_addr,
+                                    Reason = "Invalid ManageSieve command",
+                                );
+
+                                return SessionResult::Close;
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                trc::error!(err
+                                    .span_id(self.session_id)
+                                    .details("Failed to check for fail2ban"));
+                            }
+                        }
+                    }
+
                     if let Err(err) = self.write_error(response).await {
                         trc::error!(err.span_id(self.session_id));
                         return SessionResult::Close;
@@ -118,7 +146,7 @@ impl<T: SessionStream> Session<T> {
             Command::Capability | Command::Logout | Command::Noop => Ok(command),
             Command::Authenticate => {
                 if let State::NotAuthenticated { .. } = &self.state {
-                    if self.stream.is_tls() || self.jmap.core.imap.allow_plain_auth {
+                    if self.stream.is_tls() || self.server.core.imap.allow_plain_auth {
                         Ok(command)
                     } else {
                         Err(trc::ManageSieveEvent::Error
@@ -151,9 +179,9 @@ impl<T: SessionStream> Session<T> {
             | Command::CheckScript
             | Command::Unauthenticate => {
                 if let State::Authenticated { access_token, .. } = &self.state {
-                    if let Some(rate) = &self.jmap.core.imap.rate_requests {
+                    if let Some(rate) = &self.server.core.imap.rate_requests {
                         if self
-                            .jmap
+                            .server
                             .core
                             .storage
                             .lookup
@@ -239,7 +267,7 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
 
 impl<T: AsyncWrite + AsyncRead> Session<T> {
     pub async fn get_script_id(&self, account_id: u32, name: &str) -> trc::Result<u32> {
-        self.jmap
+        self.server
             .core
             .storage
             .data

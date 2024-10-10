@@ -5,6 +5,7 @@
  */
 
 use std::{
+    borrow::Cow,
     io::{self, Cursor, Read},
     path::PathBuf,
 };
@@ -22,16 +23,25 @@ pub struct WebAdminManager {
     routes: ArcSwap<AHashMap<String, Resource<PathBuf>>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Resource<T> {
-    pub content_type: &'static str,
+    pub content_type: Cow<'static, str>,
     pub contents: T,
 }
 
-impl WebAdminManager {
-    pub fn new() -> Self {
+impl<T> Resource<T> {
+    pub fn new(content_type: impl Into<Cow<'static, str>>, contents: T) -> Self {
         Self {
-            bundle_path: TempDir::new(),
+            content_type: content_type.into(),
+            contents,
+        }
+    }
+}
+
+impl WebAdminManager {
+    pub fn new(base_path: PathBuf) -> Self {
+        Self {
+            bundle_path: TempDir::new(base_path),
             routes: ArcSwap::from_pointee(Default::default()),
         }
     }
@@ -42,7 +52,7 @@ impl WebAdminManager {
             tokio::fs::read(&resource.contents)
                 .await
                 .map(|contents| Resource {
-                    content_type: resource.content_type,
+                    content_type: resource.content_type.clone(),
                     contents,
                 })
                 .map_err(|err| {
@@ -114,7 +124,8 @@ impl WebAdminManager {
                     "svg" => "image/svg+xml",
                     "ico" => "image/x-icon",
                     _ => "application/octet-stream",
-                },
+                }
+                .into(),
                 contents: path,
             };
 
@@ -160,9 +171,9 @@ pub struct TempDir {
 }
 
 impl TempDir {
-    pub fn new() -> TempDir {
+    pub fn new(path: PathBuf) -> TempDir {
         TempDir {
-            path: std::env::temp_dir().join(std::str::from_utf8(WEBADMIN_KEY).unwrap()),
+            path: path.join(std::str::from_utf8(WEBADMIN_KEY).unwrap()),
         }
     }
 
@@ -182,13 +193,13 @@ fn unpack_error(err: std::io::Error) -> trc::Error {
 
 impl Default for WebAdminManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::env::temp_dir())
     }
 }
 
 impl Default for TempDir {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::env::temp_dir())
     }
 }
 

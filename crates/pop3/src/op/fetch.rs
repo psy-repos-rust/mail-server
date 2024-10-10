@@ -7,7 +7,8 @@
 use std::time::Instant;
 
 use common::listener::SessionStream;
-use jmap::email::metadata::MessageMetadata;
+use directory::Permission;
+use jmap::{blob::download::BlobDownload, email::metadata::MessageMetadata, JmapMethods};
 use jmap_proto::types::{collection::Collection, property::Property};
 use store::write::Bincode;
 use trc::AddContext;
@@ -16,11 +17,16 @@ use crate::{protocol::response::Response, Session};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_fetch(&mut self, msg: u32, lines: Option<u32>) -> trc::Result<()> {
+        // Validate access
+        self.state
+            .access_token()
+            .assert_has_permission(Permission::Pop3Retr)?;
+
         let op_start = Instant::now();
         let mailbox = self.state.mailbox();
         if let Some(message) = mailbox.messages.get(msg.saturating_sub(1) as usize) {
             if let Some(metadata) = self
-                .jmap
+                .server
                 .get_property::<Bincode<MessageMetadata>>(
                     mailbox.account_id,
                     Collection::Email,
@@ -31,7 +37,7 @@ impl<T: SessionStream> Session<T> {
                 .caused_by(trc::location!())?
             {
                 if let Some(bytes) = self
-                    .jmap
+                    .server
                     .get_blob(&metadata.inner.blob_hash, 0..usize::MAX)
                     .await
                     .caused_by(trc::location!())?

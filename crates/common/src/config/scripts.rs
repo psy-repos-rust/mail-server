@@ -11,13 +11,14 @@ use std::{
 };
 
 use ahash::AHashMap;
-use nlp::bayes::cache::BayesTokenCache;
-use parking_lot::RwLock;
 use sieve::{compiler::grammar::Capability, Compiler, Runtime, Sieve};
 use store::Stores;
 use utils::config::Config;
 
-use crate::scripts::{functions::register_functions, plugins::RegisterSievePlugins};
+use crate::scripts::{
+    functions::{register_functions_trusted, register_functions_untrusted},
+    plugins::RegisterSievePlugins,
+};
 
 use super::{if_block::IfBlock, smtp::SMTP_RCPT_TO_VARS, tokenizer::TokenMap};
 
@@ -33,11 +34,6 @@ pub struct Scripting {
     pub untrusted_scripts: AHashMap<String, Arc<Sieve>>,
 }
 
-pub struct ScriptCache {
-    pub bayes_cache: BayesTokenCache,
-    pub remote_lists: RwLock<AHashMap<String, RemoteList>>,
-}
-
 #[derive(Clone)]
 pub struct RemoteList {
     pub entries: HashSet<String>,
@@ -47,6 +43,7 @@ pub struct RemoteList {
 impl Scripting {
     pub async fn parse(config: &mut Config, stores: &Stores) -> Self {
         // Parse untrusted compiler
+        let mut fnc_map_untrusted = register_functions_untrusted().register_plugins_untrusted();
         let untrusted_compiler = Compiler::new()
             .with_max_script_size(
                 config
@@ -97,10 +94,12 @@ impl Scripting {
                 config
                     .property("sieve.untrusted.limits.includes")
                     .unwrap_or(3),
-            );
+            )
+            .register_functions(&mut fnc_map_untrusted);
 
         // Parse untrusted runtime
         let untrusted_runtime = Runtime::new()
+            .with_functions(&mut fnc_map_untrusted)
             .with_max_nested_includes(
                 config
                     .property("sieve.untrusted.limits.nested-includes")
@@ -148,6 +147,7 @@ impl Scripting {
                     .unwrap_or(Duration::from_secs(7 * 86400))
                     .as_secs(),
             )
+            .with_capability(Capability::Expressions)
             .without_capabilities(
                 config
                     .values("sieve.untrusted.disable-capabilities")
@@ -198,7 +198,7 @@ impl Scripting {
             .with_env_variable("phase", "during");
 
         // Parse trusted compiler and runtime
-        let mut fnc_map = register_functions().register_plugins();
+        let mut fnc_map_trusted = register_functions_trusted().register_plugins_trusted();
 
         // Allocate compiler and runtime
         let trusted_compiler = Compiler::new()
@@ -215,7 +215,7 @@ impl Scripting {
                     .property_or_default("sieve.trusted.no-capability-check", "true")
                     .unwrap_or(true),
             )
-            .register_functions(&mut fnc_map);
+            .register_functions(&mut fnc_map_trusted);
 
         let mut trusted_runtime = Runtime::new()
             .without_capabilities([
@@ -240,7 +240,7 @@ impl Scripting {
             .with_max_header_size(10240)
             .with_valid_notification_uri("mailto")
             .with_valid_ext_lists(stores.lookup_stores.keys().map(|k| k.to_string()))
-            .with_functions(&mut fnc_map)
+            .with_functions(&mut fnc_map_trusted)
             .with_max_redirects(
                 config
                     .property_or_default("sieve.trusted.limits.redirects", "3")
@@ -364,25 +364,6 @@ impl Scripting {
     }
 }
 
-impl ScriptCache {
-    pub fn parse(config: &mut Config) -> Self {
-        ScriptCache {
-            bayes_cache: BayesTokenCache::new(
-                config
-                    .property_or_default("cache.bayes.capacity", "8192")
-                    .unwrap_or(8192),
-                config
-                    .property_or_default("cache.bayes.ttl.positive", "1h")
-                    .unwrap_or_else(|| Duration::from_secs(3600)),
-                config
-                    .property_or_default("cache.bayes.ttl.negative", "1h")
-                    .unwrap_or_else(|| Duration::from_secs(3600)),
-            ),
-            remote_lists: Default::default(),
-        }
-    }
-}
-
 impl Default for Scripting {
     fn default() -> Self {
         Scripting {
@@ -406,19 +387,6 @@ impl Default for Scripting {
             ),
             untrusted_scripts: AHashMap::new(),
             trusted_scripts: AHashMap::new(),
-        }
-    }
-}
-
-impl Default for ScriptCache {
-    fn default() -> Self {
-        Self {
-            bayes_cache: BayesTokenCache::new(
-                8192,
-                Duration::from_secs(3600),
-                Duration::from_secs(3600),
-            ),
-            remote_lists: Default::default(),
         }
     }
 }

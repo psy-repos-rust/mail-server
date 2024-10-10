@@ -1,11 +1,12 @@
 [package]
 name = "directory"
-version = "0.9.4"
+version = "0.10.4"
 edition = "2021"
 resolver = "2"
 
 [dependencies]
 utils = { path =  "../utils" }
+proc_macros = { path =  "../utils/proc-macros" }
 store = { path =  "../store" }
 trc = { path = "../trc" }
 jmap_proto = { path =  "../jmap-proto" }
@@ -35,9 +36,13 @@ futures = "0.3"
 regex = "1.7.0"
 serde = { version = "1.0", features = ["derive"]}
 totp-rs = { version = "5.5.1", features = ["otpauth"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2"] }
+serde_json = "1.0"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1.23", features = ["full"] }
 
 [features]
 test_mode = []
+enterprise = []
