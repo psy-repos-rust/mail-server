@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use common::{config::server::ServerProtocol, core::BuildServer, ipc::QueueEvent};
 use mail_auth::MX;
 
-use crate::smtp::{session::TestSession, DnsCache, TestSMTP};
+use crate::smtp::{DnsCache, TestSMTP, session::TestSession};
 use smtp::queue::manager::Queue;
 
 const LOCAL: &str = r#"
@@ -75,7 +75,7 @@ async fn concurrent_queue() {
     );
 
     let mut session = local.new_session();
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.ehlo("mx.test.org").await;
 

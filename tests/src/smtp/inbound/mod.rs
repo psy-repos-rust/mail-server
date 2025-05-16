@@ -7,12 +7,14 @@
 use std::time::Duration;
 
 use common::{
-    ipc::{DmarcEvent, QueueEvent, QueueEventStatus, ReportingEvent, TlsEvent},
     Server,
+    ipc::{DmarcEvent, QueueEvent, QueueEventStatus, ReportingEvent, TlsEvent},
 };
 use store::{
-    write::{key::DeserializeBigEndian, Bincode, QueueClass, ReportEvent, ValueClass},
-    Deserialize, IterateParams, ValueKey, U64_LEN,
+    Deserialize, IterateParams, U64_LEN, ValueKey,
+    write::{
+        AlignedBytes, Archive, QueueClass, ReportEvent, ValueClass, key::DeserializeBigEndian,
+    },
 };
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -186,9 +188,10 @@ impl QueueReceiver {
             .iterate(
                 IterateParams::new(from_key, to_key).descending(),
                 |key, value| {
-                    let value = Bincode::<Message>::deserialize(value)?;
-                    assert_eq!(key.deserialize_be_u64(0)?, value.inner.queue_id);
-                    messages.push(value.inner);
+                    let value = <Archive<AlignedBytes> as Deserialize>::deserialize(value)?
+                        .deserialize::<Message>()?;
+                    assert_eq!(key.deserialize_be_u64(0)?, value.queue_id);
+                    messages.push(value);
                     Ok(true)
                 },
             )

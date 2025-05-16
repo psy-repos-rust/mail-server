@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::expr::{if_block::IfBlock, tokenizer::TokenMap};
 use ahash::AHashSet;
+
 use utils::config::{Config, Rate};
 
 use super::*;
@@ -141,7 +142,7 @@ impl ContactForm {
             from_email: FieldOrDefault::parse(config, "form.email", "postmaster@localhost"),
             from_subject: FieldOrDefault::parse(config, "form.subject", "Contact form submission"),
             from_name: FieldOrDefault::parse(config, "form.name", "Anonymous"),
-            field_honey_pot: config.value("form.honey-pot.field").map(|v| v.to_string()),
+            field_honey_pot: config.value("form.honey-pot.field").map(|v| v.into()),
             rate: config
                 .property_or_default::<Option<Rate>>("form.rate-limit", "5/1h")
                 .unwrap_or_default(),

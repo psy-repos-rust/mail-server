@@ -12,19 +12,19 @@ use std::{
 use ahash::AHashMap;
 use mail_parser::DateTime;
 use opentelemetry::{
+    InstrumentationLibrary, Key, KeyValue, Value,
     logs::{AnyValue, Severity},
     trace::{SpanContext, SpanKind, Status, TraceFlags, TraceState},
-    InstrumentationLibrary, Key, KeyValue, Value,
 };
 use opentelemetry_sdk::{
+    Resource,
     export::{logs::LogBatch, trace::SpanData},
     trace::{SpanEvents, SpanLinks},
-    Resource,
 };
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
-use trc::{ipc::subscriber::SubscriberBuilder, Event, EventDetails, Level, TelemetryEvent};
+use trc::{Event, EventDetails, Level, TelemetryEvent, ipc::subscriber::SubscriberBuilder};
 
-use crate::{config::telemetry::OtelTracer, telemetry::LONG_SLUMBER};
+use crate::{LONG_1Y_SLUMBER, config::telemetry::OtelTracer};
 
 const MAX_EVENTS: usize = 2048;
 
@@ -42,7 +42,7 @@ pub(crate) fn spawn_otel_tracer(builder: SubscriberBuilder, mut otel: OtelTracer
         otel.log_exporter.set_resource(&resource);
         otel.span_exporter.set_resource(&resource);
 
-        let mut wakeup_time = LONG_SLUMBER;
+        let mut wakeup_time = LONG_1Y_SLUMBER;
         let mut next_delivery = Instant::now();
 
         let mut pending_logs = Vec::new();
@@ -134,7 +134,7 @@ pub(crate) fn spawn_otel_tracer(builder: SubscriberBuilder, mut otel: OtelTracer
                     }
                 }
             }
-            wakeup_time = next_retry.unwrap_or(LONG_SLUMBER);
+            wakeup_time = next_retry.unwrap_or(LONG_1Y_SLUMBER);
         }
     });
 }
@@ -215,8 +215,7 @@ fn build_key_value(key_value: &(trc::Key, trc::Value)) -> Option<KeyValue> {
     (key_value.0 != trc::Key::SpanId).then(|| KeyValue {
         key: build_key(&key_value.0),
         value: match &key_value.1 {
-            trc::Value::Static(v) => Value::String((*v).into()),
-            trc::Value::String(v) => Value::String(v.clone().into()),
+            trc::Value::String(v) => Value::String(v.to_string().into()),
             trc::Value::UInt(v) => Value::I64(*v as i64),
             trc::Value::Int(v) => Value::I64(*v),
             trc::Value::Float(v) => Value::F64(*v),
@@ -241,8 +240,7 @@ fn build_key(key: &trc::Key) -> Key {
 
 fn build_any_value(value: &trc::Value) -> AnyValue {
     match value {
-        trc::Value::Static(v) => AnyValue::String((*v).into()),
-        trc::Value::String(v) => AnyValue::String(v.clone().into()),
+        trc::Value::String(v) => AnyValue::String(v.to_string().into()),
         trc::Value::UInt(v) => AnyValue::Int(*v as i64),
         trc::Value::Int(v) => AnyValue::Int(*v),
         trc::Value::Float(v) => AnyValue::Double(*v),

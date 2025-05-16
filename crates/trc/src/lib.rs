@@ -16,6 +16,7 @@ use std::{
 };
 
 pub use crate::ipc::collector::Collector;
+use compact_str::CompactString;
 pub use event_macro::event;
 
 use event_macro::{event_family, event_type, key_names, total_event_count};
@@ -53,8 +54,7 @@ pub enum Level {
 
 #[derive(Debug, Default, Clone)]
 pub enum Value {
-    Static(&'static str),
-    String(String),
+    String(CompactString),
     UInt(u64),
     Int(i64),
     Float(f64),
@@ -187,6 +187,8 @@ pub enum EventType {
     Telemetry(TelemetryEvent),
     Security(SecurityEvent),
     Ai(AiEvent),
+    WebDav(WebDavEvent),
+    Calendar(CalendarEvent),
 }
 
 #[event_type]
@@ -212,19 +214,17 @@ pub enum SecurityEvent {
 
 #[event_type]
 pub enum ClusterEvent {
-    PeerAlive,
-    PeerDiscovered,
-    PeerOffline,
-    PeerSuspected,
-    PeerSuspectedIsAlive,
-    PeerBackOnline,
-    PeerLeaving,
-    PeerHasChanges,
-    OneOrMorePeersOffline,
-    EmptyPacket,
-    InvalidPacket,
-    DecryptionError,
-    Error,
+    SubscriberStart,
+    SubscriberStop,
+    SubscriberError,
+    SubscriberDisconnected,
+    PublisherStart,
+    PublisherStop,
+    PublisherError,
+    MessageReceived,
+    MessageSkipped,
+    MessageInvalid,
+    ClockSkewDetected,
 }
 
 #[event_type]
@@ -828,6 +828,7 @@ pub enum StoreEvent {
     ElasticsearchError,
     RedisError,
     S3Error,
+    NatsError,
     AzureError,
     FilesystemError,
     PoolError,
@@ -948,6 +949,36 @@ pub enum ResourceEvent {
 pub enum AiEvent {
     LlmResponse,
     ApiError,
+}
+
+#[event_type]
+pub enum WebDavEvent {
+    // Requests
+    Propfind,
+    Proppatch,
+    Get,
+    Head,
+    Report,
+    Mkcol,
+    Mkcalendar,
+    Delete,
+    Put,
+    Post,
+    Patch,
+    Copy,
+    Move,
+    Lock,
+    Unlock,
+    Acl,
+    Options,
+
+    // Errors
+    Error,
+}
+
+#[event_type]
+pub enum CalendarEvent {
+    RuleExpansionError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

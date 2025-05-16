@@ -52,6 +52,8 @@ impl EventType {
             EventType::MessageIngest(event) => event.description(),
             EventType::Security(event) => event.description(),
             EventType::Ai(event) => event.description(),
+            EventType::WebDav(event) => event.description(),
+            EventType::Calendar(event) => event.description(),
         }
     }
 
@@ -100,6 +102,8 @@ impl EventType {
             EventType::MessageIngest(event) => event.explain(),
             EventType::Security(event) => event.explain(),
             EventType::Ai(event) => event.explain(),
+            EventType::WebDav(event) => event.explain(),
+            EventType::Calendar(event) => event.explain(),
         }
     }
 }
@@ -133,37 +137,35 @@ impl HttpEvent {
 impl ClusterEvent {
     pub fn description(&self) -> &'static str {
         match self {
-            ClusterEvent::PeerAlive => "A peer is alive",
-            ClusterEvent::PeerDiscovered => "A new peer was discovered",
-            ClusterEvent::PeerOffline => "A peer went offline",
-            ClusterEvent::PeerSuspected => "A peer is suspected to be offline",
-            ClusterEvent::PeerSuspectedIsAlive => "A suspected peer is actually alive",
-            ClusterEvent::PeerBackOnline => "A peer came back online",
-            ClusterEvent::PeerLeaving => "A peer is leaving the cluster",
-            ClusterEvent::PeerHasChanges => "A peer has reported changes",
-            ClusterEvent::OneOrMorePeersOffline => "One or more peers are offline",
-            ClusterEvent::EmptyPacket => "Received an empty gossip packet",
-            ClusterEvent::InvalidPacket => "Received an invalid gossip packet",
-            ClusterEvent::DecryptionError => "Failed to decrypt a gossip packet",
-            ClusterEvent::Error => "A cluster error occurred",
+            ClusterEvent::SubscriberStart => "PubSub subscriber started",
+            ClusterEvent::SubscriberStop => "PubSub subscriber stopped",
+            ClusterEvent::SubscriberError => "PubSub subscriber error",
+            ClusterEvent::SubscriberDisconnected => "PubSub subscriber disconnected",
+            ClusterEvent::PublisherStart => "PubSub publisher started",
+            ClusterEvent::PublisherStop => "PubSub publisher stopped",
+            ClusterEvent::PublisherError => "PubSub publisher error",
+            ClusterEvent::MessageReceived => "PubSub message received",
+            ClusterEvent::MessageSkipped => "PubSub message skipped",
+            ClusterEvent::MessageInvalid => "Invalid PubSub message",
+            ClusterEvent::ClockSkewDetected => "Clock skew detected",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
-            ClusterEvent::PeerAlive => "A peer is alive and reachable",
-            ClusterEvent::PeerDiscovered => "A new peer was discovered",
-            ClusterEvent::PeerOffline => "A peer is offline",
-            ClusterEvent::PeerSuspected => "A peer is suspected to be offline",
-            ClusterEvent::PeerSuspectedIsAlive => "A suspected peer is actually alive",
-            ClusterEvent::PeerBackOnline => "A peer came back online",
-            ClusterEvent::PeerLeaving => "A peer is leaving the cluster",
-            ClusterEvent::PeerHasChanges => "A peer has reported changes",
-            ClusterEvent::OneOrMorePeersOffline => "One or more peers are offline",
-            ClusterEvent::EmptyPacket => "Received an empty gossip packet",
-            ClusterEvent::InvalidPacket => "Received an invalid gossip packet",
-            ClusterEvent::DecryptionError => "Failed to decrypt a gossip packet",
-            ClusterEvent::Error => "An error occurred in the cluster",
+            ClusterEvent::SubscriberStart => "The PubSub subscriber has started",
+            ClusterEvent::SubscriberStop => "The PubSub subscriber has stopped",
+            ClusterEvent::SubscriberError => "An error occurred while subscribing to PubSub",
+            ClusterEvent::SubscriberDisconnected => "The PubSub subscriber has disconnected",
+            ClusterEvent::PublisherStart => "The PubSub publisher has started",
+            ClusterEvent::PublisherStop => "The PubSub publisher has stopped",
+            ClusterEvent::PublisherError => "An error occurred while publishing to PubSub",
+            ClusterEvent::MessageReceived => "A message was received from the PubSub server",
+            ClusterEvent::MessageSkipped => "A message originating from this node was skipped",
+            ClusterEvent::MessageInvalid => {
+                "An invalid message was received from the PubSub server"
+            }
+            ClusterEvent::ClockSkewDetected => "A large clock skew was detected between nodes",
         }
     }
 }
@@ -1142,12 +1144,11 @@ impl ServerEvent {
     pub fn description(&self) -> &'static str {
         match self {
             ServerEvent::Startup => {
-                concat!("Starting Stalwart Mail Server v", env!("CARGO_PKG_VERSION"))
+                concat!("Starting Stalwart Server v", env!("CARGO_PKG_VERSION"))
             }
-            ServerEvent::Shutdown => concat!(
-                "Shutting down Stalwart Mail Server v",
-                env!("CARGO_PKG_VERSION")
-            ),
+            ServerEvent::Shutdown => {
+                concat!("Shutting down Stalwart Server v", env!("CARGO_PKG_VERSION"))
+            }
             ServerEvent::StartupError => "Server startup error",
             ServerEvent::ThreadError => "Server thread error",
             ServerEvent::Licensing => "Server licensing event",
@@ -1156,8 +1157,8 @@ impl ServerEvent {
 
     pub fn explain(&self) -> &'static str {
         match self {
-            ServerEvent::Startup => "Stalwart Mail Server has started",
-            ServerEvent::Shutdown => "Stalwart Mail Server is shutting down",
+            ServerEvent::Startup => "Stalwart Server has started",
+            ServerEvent::Shutdown => "Stalwart Server is shutting down",
             ServerEvent::StartupError => "An error occurred while starting the server",
             ServerEvent::ThreadError => "An error occurred with a server thread",
             ServerEvent::Licensing => "A licensing event occurred",
@@ -1556,6 +1557,7 @@ impl StoreEvent {
             StoreEvent::DataIterate => "Data store iteration operation",
             StoreEvent::HttpStoreFetch => "HTTP store updated",
             StoreEvent::HttpStoreError => "Error updating HTTP store",
+            StoreEvent::NatsError => "NATS error",
         }
     }
 
@@ -1593,6 +1595,7 @@ impl StoreEvent {
             StoreEvent::DataIterate => "A data store iteration operation was executed",
             StoreEvent::HttpStoreFetch => "The HTTP store was updated",
             StoreEvent::HttpStoreError => "An error occurred while updating the HTTP store",
+            StoreEvent::NatsError => "A NATS error occurred",
         }
     }
 }
@@ -1823,6 +1826,73 @@ impl AiEvent {
         match self {
             AiEvent::LlmResponse => "An LLM response has been received",
             AiEvent::ApiError => "An AI API error occurred",
+        }
+    }
+}
+
+impl WebDavEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            WebDavEvent::Propfind => "WebDAV PROPFIND request",
+            WebDavEvent::Proppatch => "WebDAV PROPPATCH request",
+            WebDavEvent::Get => "WebDAV GET request",
+            WebDavEvent::Report => "WebDAV REPORT request",
+            WebDavEvent::Mkcol => "WebDAV MKCOL request",
+            WebDavEvent::Delete => "WebDAV DELETE request",
+            WebDavEvent::Put => "WebDAV PUT request",
+            WebDavEvent::Post => "WebDAV POST request",
+            WebDavEvent::Patch => "WebDAV PATCH request",
+            WebDavEvent::Copy => "WebDAV COPY request",
+            WebDavEvent::Move => "WebDAV MOVE request",
+            WebDavEvent::Lock => "WebDAV LOCK request",
+            WebDavEvent::Unlock => "WebDAV UNLOCK request",
+            WebDavEvent::Acl => "WebDAV ACL request",
+            WebDavEvent::Error => "WebDAV error",
+            WebDavEvent::Head => "WebDAV HEAD request",
+            WebDavEvent::Mkcalendar => "WebDAV MKCALENDAR request",
+            WebDavEvent::Options => "WebDAV OPTIONS request",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            WebDavEvent::Propfind => "A PROPFIND request has been made to the server",
+            WebDavEvent::Proppatch => "A PROPPATCH request has been made to the server",
+            WebDavEvent::Get => "A GET request has been made to the server",
+            WebDavEvent::Report => "A REPORT request has been made to the server",
+            WebDavEvent::Mkcol => "A MKCOL request has been made to the server",
+            WebDavEvent::Delete => "A DELETE request has been made to the server",
+            WebDavEvent::Put => "A PUT request has been made to the server",
+            WebDavEvent::Post => "A POST request has been made to the server",
+            WebDavEvent::Patch => "A PATCH request has been made to the server",
+            WebDavEvent::Copy => "A COPY request has been made to the server",
+            WebDavEvent::Move => "A MOVE request has been made to the server",
+            WebDavEvent::Lock => "A LOCK request has been made to the server",
+            WebDavEvent::Unlock => "An UNLOCK request has been made to the server",
+            WebDavEvent::Acl => {
+                "An ACL request has been made to the
+                server"
+            }
+            WebDavEvent::Error => "An error occurred with the WebDAV request",
+            WebDavEvent::Head => "A HEAD request has been made to the server",
+            WebDavEvent::Mkcalendar => "A MKCALENDAR request has been made to the server",
+            WebDavEvent::Options => "An OPTIONS request has been made to the server",
+        }
+    }
+}
+
+impl CalendarEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            CalendarEvent::RuleExpansionError => "Calendar rule expansion error",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            CalendarEvent::RuleExpansionError => {
+                "An error occurred while expanding calendar recurrences"
+            }
         }
     }
 }

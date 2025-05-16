@@ -4,31 +4,24 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{sync::Arc, time::Instant};
-
+use super::{ImapContext, ToModSeq};
+use crate::core::{ImapId, SavedSearch, SelectedMailbox, Session, SessionData};
 use ahash::AHashMap;
+use common::{listener::SessionStream, storage::index::ObjectIndexBuilder};
 use directory::Permission;
-use email::mailbox::UidMailbox;
+use email::{
+    cache::{MessageCacheFetch, email::MessageCacheAccess},
+    message::{delete::EmailDeletion, metadata::MessageData},
+};
 use imap_proto::{
+    Command, ResponseCode, ResponseType, StatusResponse,
     parser::parse_sequence_set,
     receiver::{Request, Token},
-    Command, ResponseCode, ResponseType, StatusResponse,
 };
+use jmap_proto::types::{acl::Acl, collection::Collection, keyword::Keyword};
+use std::{sync::Arc, time::Instant};
+use store::{roaring::RoaringBitmap, write::BatchBuilder};
 use trc::AddContext;
-
-use crate::core::{SavedSearch, SelectedMailbox, Session, SessionData};
-use common::{listener::SessionStream, ImapId};
-use jmap::email::{delete::EmailDeletion, set::TagManager};
-use jmap_proto::types::{
-    acl::Acl, collection::Collection, id::Id, keyword::Keyword, property::Property,
-    state::StateChange, type_state::DataType,
-};
-use store::{
-    roaring::RoaringBitmap,
-    write::{assert::HashedValue, log::ChangeLogBuilder, BatchBuilder, F_VALUE},
-};
-
-use super::{ImapContext, ToModSeq};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_expunge(
@@ -118,28 +111,14 @@ impl<T: SessionStream> SessionData<T> {
     ) -> trc::Result<()> {
         // Obtain message ids
         let account_id = mailbox.id.account_id;
-        let mut deleted_ids = self
-            .server
-            .get_tag(
-                account_id,
-                Collection::Email,
-                Property::MailboxIds,
-                mailbox.id.mailbox_id,
-            )
-            .await
-            .caused_by(trc::location!())?
-            .unwrap_or_default()
-            & self
-                .server
-                .get_tag(
-                    account_id,
-                    Collection::Email,
-                    Property::Keywords,
-                    Keyword::Deleted,
-                )
+        let mut deleted_ids = RoaringBitmap::from_iter(
+            self.server
+                .get_cached_messages(account_id)
                 .await
                 .caused_by(trc::location!())?
-                .unwrap_or_default();
+                .in_mailbox_with_keyword(mailbox.id.mailbox_id, &Keyword::Deleted)
+                .map(|m| m.document_id),
+        );
 
         // Filter by sequence
         if let Some(sequence) = &sequence {
@@ -147,15 +126,10 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         // Delete ids
-        let mut changelog = ChangeLogBuilder::new();
-        self.email_untag_or_delete(
-            account_id,
-            mailbox.id.mailbox_id,
-            &deleted_ids,
-            &mut changelog,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let mut batch = BatchBuilder::new();
+        self.email_untag_or_delete(account_id, mailbox.id.mailbox_id, &deleted_ids, &mut batch)
+            .await
+            .caused_by(trc::location!())?;
 
         trc::event!(
             Imap(trc::ImapEvent::Expunge),
@@ -167,16 +141,11 @@ impl<T: SessionStream> SessionData<T> {
         );
 
         // Write changes on source account
-        if !changelog.is_empty() {
-            let change_id = self.server.commit_changes(account_id, changelog).await?;
+        if !batch.is_empty() {
             self.server
-                .broadcast_state_change(
-                    StateChange::new(account_id)
-                        .with_change(DataType::Email, change_id)
-                        .with_change(DataType::Mailbox, change_id)
-                        .with_change(DataType::Thread, change_id),
-                )
-                .await;
+                .commit_batch(batch)
+                .await
+                .caused_by(trc::location!())?;
         }
 
         Ok(())
@@ -187,99 +156,54 @@ impl<T: SessionStream> SessionData<T> {
         account_id: u32,
         mailbox_id: u32,
         deleted_ids: &RoaringBitmap,
-        changelog: &mut ChangeLogBuilder,
+        batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
-        let mailbox_id = UidMailbox::new_unassigned(mailbox_id);
         let mut destroy_ids = RoaringBitmap::new();
+        batch
+            .with_account_id(account_id)
+            .with_collection(Collection::Email);
 
-        for (id, mailbox_ids) in self
-            .server
-            .get_properties::<HashedValue<Vec<UidMailbox>>, _, _>(
-                account_id,
-                Collection::Email,
-                deleted_ids,
-                Property::MailboxIds,
-            )
-            .await
-            .caused_by(trc::location!())?
-        {
-            let mut mailboxes = TagManager::new(mailbox_ids);
+        self.server
+            .get_archives(account_id, Collection::Email, deleted_ids, |id, data_| {
+                let data = data_
+                    .to_unarchived::<MessageData>()
+                    .caused_by(trc::location!())?;
 
-            if mailboxes.current().contains(&mailbox_id) {
-                if mailboxes.current().len() > 1 {
-                    // Remove deleted flag
-                    let (mut keywords, thread_id) = if let (Some(keywords), Some(thread_id)) = (
-                        self.server
-                            .get_property::<HashedValue<Vec<Keyword>>>(
-                                account_id,
-                                Collection::Email,
-                                id,
-                                Property::Keywords,
-                            )
-                            .await
-                            .caused_by(trc::location!())?,
-                        self.server
-                            .get_property::<u32>(
-                                account_id,
-                                Collection::Email,
-                                id,
-                                Property::ThreadId,
-                            )
-                            .await
-                            .caused_by(trc::location!())?,
-                    ) {
-                        (TagManager::new(keywords), thread_id)
-                    } else {
-                        continue;
-                    };
-
-                    // Untag message from this mailbox and remove Deleted flag
-                    mailboxes.update(mailbox_id, false);
-                    keywords.update(Keyword::Deleted, false);
-
-                    // Write changes
-                    let mut batch = BatchBuilder::new();
-                    batch
-                        .with_account_id(account_id)
-                        .with_collection(Collection::Email)
-                        .update_document(id);
-                    mailboxes.update_batch(&mut batch, Property::MailboxIds);
-                    keywords.update_batch(&mut batch, Property::Keywords);
-                    if changelog.change_id == u64::MAX {
-                        changelog.change_id = self.server.assign_change_id(account_id)?
-                    }
-                    batch.value(Property::Cid, changelog.change_id, F_VALUE);
-                    match self
-                        .server
-                        .store()
-                        .write(batch)
-                        .await
-                        .caused_by(trc::location!())
-                    {
-                        Ok(_) => {
-                            changelog.log_update(Collection::Email, Id::from_parts(thread_id, id));
-                            changelog.log_child_update(Collection::Mailbox, mailbox_id.mailbox_id);
-                        }
-                        Err(err) => {
-                            if !err.is_assertion_failure() {
-                                return Err(err.caused_by(trc::location!()));
-                            }
-                        }
-                    }
-                } else {
+                if !data.inner.has_mailbox_id(mailbox_id) {
+                    return Ok(true);
+                } else if data.inner.mailboxes.len() == 1 {
                     destroy_ids.insert(id);
+                    return Ok(true);
                 }
-            }
-        }
+
+                // Untag message from this mailbox and remove Deleted flag
+                let mut new_data = data.deserialize().caused_by(trc::location!())?;
+                new_data.change_id = batch.change_id();
+                new_data.remove_mailbox(mailbox_id);
+                new_data.remove_keyword(&Keyword::Deleted);
+
+                // Write changes
+                batch
+                    .update_document(id)
+                    .custom(
+                        ObjectIndexBuilder::new()
+                            .with_current(data)
+                            .with_changes(new_data),
+                    )
+                    .caused_by(trc::location!())?
+                    .commit_point();
+
+                Ok(true)
+            })
+            .await
+            .caused_by(trc::location!())?;
 
         if !destroy_ids.is_empty() {
             // Delete message from all mailboxes
-            let (changes, _) = self
-                .server
-                .emails_tombstone(account_id, destroy_ids)
+            self.server
+                .emails_tombstone(account_id, batch, destroy_ids)
                 .await
                 .caused_by(trc::location!())?;
-            changelog.merge(changes);
         }
 
         Ok(())

@@ -4,32 +4,21 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{auth::AccessToken, Server};
+use crate::{blob::download::BlobDownload, changes::state::MessageCacheState};
+use common::{Server, auth::AccessToken};
 use email::{
-    ingest::{EmailIngest, IngestEmail, IngestSource},
-    mailbox::MailboxFnc,
+    cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
+    message::ingest::{EmailIngest, IngestEmail, IngestSource},
 };
+use http_proto::HttpSessionData;
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::import::{ImportEmailRequest, ImportEmailResponse},
-    types::{
-        acl::Acl,
-        collection::Collection,
-        id::Id,
-        property::Property,
-        state::{State, StateChange},
-        type_state::DataType,
-    },
+    types::{acl::Acl, id::Id, property::Property, state::State},
 };
 use mail_parser::MessageParser;
-use utils::map::vec_map::VecMap;
-
-use crate::{
-    api::http::HttpSessionData, auth::acl::AclMethods, blob::download::BlobDownload,
-    changes::state::StateManager,
-};
-
 use std::future::Future;
+use utils::map::vec_map::VecMap;
 
 pub trait EmailImport: Sync + Send {
     fn email_import(
@@ -49,15 +38,10 @@ impl EmailImport for Server {
     ) -> trc::Result<ImportEmailResponse> {
         // Validate state
         let account_id = request.account_id.document_id();
-        let old_state: State = self
-            .assert_state(account_id, Collection::Email, &request.if_in_state)
-            .await?;
-
-        let valid_mailbox_ids = self.mailbox_get_or_create(account_id).await?;
+        let cache = self.get_cached_messages(account_id).await?;
+        let old_state: State = cache.assert_state(false, &request.if_in_state)?;
         let can_add_mailbox_ids = if access_token.is_shared(account_id) {
-            self.shared_documents(access_token, account_id, Collection::Mailbox, Acl::AddItems)
-                .await?
-                .into()
+            cache.shared_mailboxes(access_token, Acl::AddItems).into()
         } else {
             None
         };
@@ -71,7 +55,6 @@ impl EmailImport for Server {
             old_state: old_state.into(),
             created: VecMap::with_capacity(request.emails.len()),
             not_created: VecMap::new(),
-            state_change: None,
         };
         let can_train_spam = self.email_bayes_can_train(access_token);
 
@@ -93,7 +76,7 @@ impl EmailImport for Server {
                 continue;
             }
             for mailbox_id in &mailbox_ids {
-                if !valid_mailbox_ids.contains(*mailbox_id) {
+                if !cache.has_mailbox_id(mailbox_id) {
                     response.not_created.append(
                         id,
                         SetError::invalid_properties()
@@ -175,14 +158,7 @@ impl EmailImport for Server {
 
         // Update state
         if !response.created.is_empty() {
-            response.new_state = self.get_state(account_id, Collection::Email).await?;
-            if let State::Exact(change_id) = &response.new_state {
-                response.state_change = StateChange::new(account_id)
-                    .with_change(DataType::Email, *change_id)
-                    .with_change(DataType::Mailbox, *change_id)
-                    .with_change(DataType::Thread, *change_id)
-                    .into()
-            }
+            response.new_state = self.get_cached_messages(account_id).await?.get_state(false);
         }
 
         Ok(response)

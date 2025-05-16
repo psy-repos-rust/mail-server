@@ -9,11 +9,12 @@ use std::{
     str::FromStr,
 };
 
+use compact_str::CompactString;
 use utils::map::bitmap::BitmapItem;
 
-use super::type_state::DataType;
+use super::{property::Property, type_state::DataType};
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Collection {
     Email = 0,
@@ -24,7 +25,124 @@ pub enum Collection {
     SieveScript = 5,
     PushSubscription = 6,
     Principal = 7,
+    Calendar = 8,
+    CalendarEvent = 9,
+    AddressBook = 10,
+    ContactCard = 11,
+    FileNode = 12,
+    #[default]
+    None = 13,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SyncCollection {
+    Email = 0,
+    Thread = 1,
+    Calendar = 2,
+    AddressBook = 3,
+    FileNode = 4,
+    Identity = 5,
+    EmailSubmission = 6,
+    SieveScript = 7,
+    #[default]
     None = 8,
+}
+
+impl Collection {
+    pub fn main_collection(&self) -> Collection {
+        match self {
+            Collection::Email => Collection::Mailbox,
+            Collection::CalendarEvent => Collection::Calendar,
+            Collection::ContactCard => Collection::AddressBook,
+            _ => *self,
+        }
+    }
+
+    pub fn parent_collection(&self) -> Option<Collection> {
+        match self {
+            Collection::Email => Some(Collection::Mailbox),
+            Collection::CalendarEvent => Some(Collection::Calendar),
+            Collection::ContactCard => Some(Collection::AddressBook),
+            Collection::FileNode => Some(Collection::FileNode),
+            _ => None,
+        }
+    }
+
+    pub fn child_collection(&self) -> Option<Collection> {
+        match self {
+            Collection::Mailbox => Some(Collection::Email),
+            Collection::Calendar => Some(Collection::CalendarEvent),
+            Collection::AddressBook => Some(Collection::ContactCard),
+            Collection::FileNode => Some(Collection::FileNode),
+            _ => None,
+        }
+    }
+
+    pub fn parent_property(&self) -> Option<Property> {
+        match self {
+            Collection::Email => Some(Property::MailboxIds),
+            Collection::CalendarEvent => Some(Property::ParentId),
+            Collection::ContactCard => Some(Property::ParentId),
+            Collection::FileNode => Some(Property::ParentId),
+            _ => None,
+        }
+    }
+}
+
+impl SyncCollection {
+    pub fn collection(&self, is_container: bool) -> Collection {
+        match self {
+            SyncCollection::Email => {
+                if is_container {
+                    Collection::Mailbox
+                } else {
+                    Collection::Email
+                }
+            }
+            SyncCollection::Thread => Collection::Thread,
+            SyncCollection::Calendar => {
+                if is_container {
+                    Collection::Calendar
+                } else {
+                    Collection::CalendarEvent
+                }
+            }
+            SyncCollection::AddressBook => {
+                if is_container {
+                    Collection::AddressBook
+                } else {
+                    Collection::ContactCard
+                }
+            }
+            SyncCollection::FileNode => Collection::FileNode,
+            SyncCollection::Identity => Collection::Identity,
+            SyncCollection::EmailSubmission => Collection::EmailSubmission,
+            SyncCollection::SieveScript => Collection::SieveScript,
+            SyncCollection::None => Collection::None,
+        }
+    }
+}
+
+impl From<Collection> for SyncCollection {
+    fn from(v: Collection) -> Self {
+        match v {
+            Collection::Email => SyncCollection::Email,
+            Collection::Mailbox => SyncCollection::Email,
+            Collection::Thread => SyncCollection::Thread,
+            Collection::Identity => SyncCollection::Identity,
+            Collection::EmailSubmission => SyncCollection::EmailSubmission,
+            Collection::SieveScript => SyncCollection::SieveScript,
+            Collection::PushSubscription => SyncCollection::None,
+            Collection::Principal => SyncCollection::None,
+            Collection::Calendar => SyncCollection::Calendar,
+            Collection::CalendarEvent => SyncCollection::Calendar,
+            Collection::AddressBook => SyncCollection::AddressBook,
+            Collection::ContactCard => SyncCollection::AddressBook,
+            Collection::FileNode => SyncCollection::FileNode,
+            _ => SyncCollection::None,
+        }
+    }
 }
 
 impl From<u8> for Collection {
@@ -38,7 +156,28 @@ impl From<u8> for Collection {
             5 => Collection::SieveScript,
             6 => Collection::PushSubscription,
             7 => Collection::Principal,
+            8 => Collection::Calendar,
+            9 => Collection::CalendarEvent,
+            10 => Collection::AddressBook,
+            11 => Collection::ContactCard,
+            12 => Collection::FileNode,
             _ => Collection::None,
+        }
+    }
+}
+
+impl From<u8> for SyncCollection {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => SyncCollection::Email,
+            1 => SyncCollection::Thread,
+            2 => SyncCollection::Calendar,
+            3 => SyncCollection::AddressBook,
+            4 => SyncCollection::FileNode,
+            5 => SyncCollection::Identity,
+            6 => SyncCollection::EmailSubmission,
+            7 => SyncCollection::SieveScript,
+            _ => SyncCollection::None,
         }
     }
 }
@@ -54,6 +193,11 @@ impl From<u64> for Collection {
             5 => Collection::SieveScript,
             6 => Collection::PushSubscription,
             7 => Collection::Principal,
+            8 => Collection::Calendar,
+            9 => Collection::CalendarEvent,
+            10 => Collection::AddressBook,
+            11 => Collection::ContactCard,
+            12 => Collection::FileNode,
             _ => Collection::None,
         }
     }
@@ -61,6 +205,12 @@ impl From<u64> for Collection {
 
 impl From<Collection> for u8 {
     fn from(v: Collection) -> Self {
+        v as u8
+    }
+}
+
+impl From<SyncCollection> for u8 {
+    fn from(v: SyncCollection) -> Self {
         v as u8
     }
 }
@@ -105,6 +255,11 @@ impl Collection {
             Collection::EmailSubmission => "emailSubmission",
             Collection::SieveScript => "sieveScript",
             Collection::Principal => "principal",
+            Collection::Calendar => "calendar",
+            Collection::CalendarEvent => "calendarEvent",
+            Collection::AddressBook => "addressBook",
+            Collection::ContactCard => "contactCard",
+            Collection::FileNode => "fileNode",
             Collection::None => "",
         }
     }
@@ -114,23 +269,28 @@ impl FromStr for Collection {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pushSubscription" => Ok(Collection::PushSubscription),
-            "email" => Ok(Collection::Email),
-            "mailbox" => Ok(Collection::Mailbox),
-            "thread" => Ok(Collection::Thread),
-            "identity" => Ok(Collection::Identity),
-            "emailSubmission" => Ok(Collection::EmailSubmission),
-            "sieveScript" => Ok(Collection::SieveScript),
-            "principal" => Ok(Collection::Principal),
-            _ => Err(()),
-        }
+        hashify::tiny_map!(s.as_bytes(),
+            "pushSubscription" => Collection::PushSubscription,
+            "email" => Collection::Email,
+            "mailbox" => Collection::Mailbox,
+            "thread" => Collection::Thread,
+            "identity" => Collection::Identity,
+            "emailSubmission" => Collection::EmailSubmission,
+            "sieveScript" => Collection::SieveScript,
+            "principal" => Collection::Principal,
+            "calendar" => Collection::Calendar,
+            "calendarEvent" => Collection::CalendarEvent,
+            "addressBook" => Collection::AddressBook,
+            "contactCard" => Collection::ContactCard,
+            "fileNode" => Collection::FileNode,
+        )
+        .ok_or(())
     }
 }
 
 impl From<Collection> for trc::Value {
     fn from(value: Collection) -> Self {
-        trc::Value::Static(value.as_str())
+        trc::Value::String(CompactString::const_new(value.as_str()))
     }
 }
 

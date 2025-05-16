@@ -15,11 +15,11 @@ use nlp::bayes::BayesClassifier;
 use tokio::net::lookup_host;
 use utils::{
     cache::CacheItemWeight,
-    config::{utils::ParseValue, Config},
+    config::{Config, utils::ParseValue},
     glob::GlobMap,
 };
 
-use super::{functions::ResolveVariable, if_block::IfBlock, tokenizer::TokenMap, Variable};
+use super::{Variable, functions::ResolveVariable, if_block::IfBlock, tokenizer::TokenMap};
 
 #[derive(Debug, Clone, Default)]
 pub struct SpamFilterConfig {
@@ -845,8 +845,8 @@ pub struct IpResolver {
 impl ResolveVariable for IpResolver {
     fn resolve_variable(&self, variable: u32) -> Variable<'_> {
         match variable {
-            V_IP => Variable::String(self.ip_string.as_str().into()),
-            V_IP_REVERSE => Variable::String(self.reverse.as_str().into()),
+            V_IP => self.ip_string.as_str().into(),
+            V_IP_REVERSE => self.reverse.as_str().into(),
             V_IP_OCTETS => self.octets.clone(),
             V_IP_IS_V4 => Variable::Integer(self.ip.is_ipv4() as _),
             V_IP_IS_V6 => Variable::Integer(self.ip.is_ipv6() as _),

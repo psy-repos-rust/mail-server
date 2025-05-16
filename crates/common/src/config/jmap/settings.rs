@@ -8,7 +8,7 @@ use std::{str::FromStr, time::Duration};
 
 use jmap_proto::request::capability::BaseCapabilities;
 use nlp::language::Language;
-use utils::config::{cron::SimpleCron, utils::ParseValue, Config, Rate};
+use utils::config::{Config, Rate, cron::SimpleCron, utils::ParseValue};
 
 #[derive(Default, Clone)]
 pub struct JmapConfig {
@@ -16,7 +16,7 @@ pub struct JmapConfig {
     pub query_max_results: usize,
     pub snippet_max_results: usize,
 
-    pub changes_max_results: usize,
+    pub changes_max_results: Option<usize>,
     pub changes_max_history: Option<Duration>,
 
     pub request_max_size: usize,
@@ -84,7 +84,10 @@ pub struct DefaultFolder {
     pub create: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Clone, Copy, PartialEq, Eq, Hash, Debug,
+)]
+#[rkyv(derive(Debug))]
 pub enum SpecialUse {
     Inbox,
     Trash,
@@ -93,6 +96,7 @@ pub enum SpecialUse {
     Archive,
     Sent,
     Shared,
+    Important,
     None,
 }
 
@@ -238,8 +242,8 @@ impl JmapConfig {
                 .property("jmap.protocol.query.max-results")
                 .unwrap_or(5000),
             changes_max_results: config
-                .property("jmap.protocol.changes.max-results")
-                .unwrap_or(5000),
+                .property_or_default::<Option<usize>>("jmap.protocol.changes.max-results", "5000")
+                .unwrap_or_default(),
             changes_max_history: config
                 .property_or_default::<Option<Duration>>("jmap.protocol.changes.max-history", "30d")
                 .unwrap_or_default(),
@@ -372,16 +376,65 @@ impl JmapConfig {
 
 impl ParseValue for SpecialUse {
     fn parse_value(value: &str) -> Result<Self, String> {
+        hashify::tiny_map_ignore_case!(value.as_bytes(),
+            b"inbox" => SpecialUse::Inbox,
+            b"trash" => SpecialUse::Trash,
+            b"junk" => SpecialUse::Junk,
+            b"drafts" => SpecialUse::Drafts,
+            b"archive" => SpecialUse::Archive,
+            b"sent" => SpecialUse::Sent,
+            b"shared" => SpecialUse::Shared,
+            b"important" => SpecialUse::Important,
+
+        )
+        .ok_or_else(|| format!("Unknown folder role {:?}", value))
+    }
+}
+
+impl SpecialUse {
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            SpecialUse::Inbox => Some("inbox"),
+            SpecialUse::Trash => Some("trash"),
+            SpecialUse::Junk => Some("junk"),
+            SpecialUse::Drafts => Some("drafts"),
+            SpecialUse::Archive => Some("archive"),
+            SpecialUse::Sent => Some("sent"),
+            SpecialUse::Shared => Some("shared"),
+            SpecialUse::Important => Some("important"),
+            SpecialUse::None => None,
+        }
+    }
+}
+
+impl ArchivedSpecialUse {
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            ArchivedSpecialUse::Inbox => Some("inbox"),
+            ArchivedSpecialUse::Trash => Some("trash"),
+            ArchivedSpecialUse::Junk => Some("junk"),
+            ArchivedSpecialUse::Drafts => Some("drafts"),
+            ArchivedSpecialUse::Archive => Some("archive"),
+            ArchivedSpecialUse::Sent => Some("sent"),
+            ArchivedSpecialUse::Shared => Some("shared"),
+            ArchivedSpecialUse::Important => Some("important"),
+            ArchivedSpecialUse::None => None,
+        }
+    }
+}
+
+impl From<&ArchivedSpecialUse> for SpecialUse {
+    fn from(value: &ArchivedSpecialUse) -> Self {
         match value {
-            "inbox" => Ok(SpecialUse::Inbox),
-            "trash" => Ok(SpecialUse::Trash),
-            "junk" => Ok(SpecialUse::Junk),
-            "drafts" => Ok(SpecialUse::Drafts),
-            "archive" => Ok(SpecialUse::Archive),
-            "sent" => Ok(SpecialUse::Sent),
-            "shared" => Ok(SpecialUse::Shared),
-            //"none" => Ok(SpecialUse::None),
-            other => Err(format!("Unknown folder role {other:?}")),
+            ArchivedSpecialUse::Inbox => SpecialUse::Inbox,
+            ArchivedSpecialUse::Trash => SpecialUse::Trash,
+            ArchivedSpecialUse::Junk => SpecialUse::Junk,
+            ArchivedSpecialUse::Drafts => SpecialUse::Drafts,
+            ArchivedSpecialUse::Archive => SpecialUse::Archive,
+            ArchivedSpecialUse::Sent => SpecialUse::Sent,
+            ArchivedSpecialUse::Shared => SpecialUse::Shared,
+            ArchivedSpecialUse::Important => SpecialUse::Important,
+            ArchivedSpecialUse::None => SpecialUse::None,
         }
     }
 }

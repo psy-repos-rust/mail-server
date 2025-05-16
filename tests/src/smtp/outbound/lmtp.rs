@@ -7,9 +7,9 @@
 use std::time::{Duration, Instant};
 
 use crate::smtp::{
+    DnsCache, TestSMTP,
     inbound::TestMessage,
     session::{TestSession, VerifyResponse},
-    DnsCache, TestSMTP,
 };
 use common::{config::server::ServerProtocol, ipc::QueueEvent};
 use smtp::queue::spool::SmtpSpool;
@@ -81,7 +81,7 @@ async fn lmtp_delivery() {
     );
 
     let mut session = local.new_session();
-    session.data.remote_ip_str = "10.0.0.1".to_string();
+    session.data.remote_ip_str = "10.0.0.1".into();
     session.eval_session_params().await;
     session.ehlo("mx.test.org").await;
     session

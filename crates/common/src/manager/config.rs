@@ -133,7 +133,7 @@ impl ConfigManager {
         Ok(grouped)
     }
 
-    async fn db_list(
+    pub async fn db_list(
         &self,
         prefix: &str,
         strip_prefix: bool,
@@ -194,7 +194,7 @@ impl ConfigManager {
         }
 
         if !batch.is_empty() {
-            self.cfg_store.write(batch.build()).await?;
+            self.cfg_store.write(batch.build_all()).await?;
         }
 
         if !local_batch.is_empty() {
@@ -236,7 +236,7 @@ impl ConfigManager {
         } else {
             let mut batch = BatchBuilder::new();
             batch.clear(ValueClass::Config(key.to_string().into_bytes()));
-            self.cfg_store.write(batch.build()).await.map(|_| ())
+            self.cfg_store.write(batch.build_all()).await.map(|_| ())
         }
     }
 
@@ -530,7 +530,6 @@ impl Patterns {
                 Pattern::Include(MatchType::StartsWith(
                     "authentication.fallback-admin.".to_string(),
                 )),
-                Pattern::Exclude(MatchType::Equal("cluster.key".to_string())),
                 Pattern::Include(MatchType::StartsWith("cluster.".to_string())),
                 Pattern::Include(MatchType::Equal("storage.data".to_string())),
                 Pattern::Include(MatchType::Equal("storage.blob".to_string())),

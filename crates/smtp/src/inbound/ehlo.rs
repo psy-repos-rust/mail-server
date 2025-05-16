@@ -11,9 +11,10 @@ use common::{
     config::smtp::session::{Mechanism, Stage},
     listener::SessionStream,
 };
+
 use mail_auth::{
-    spf::verify::{HasValidLabels, SpfParameters},
     SpfResult,
+    spf::verify::{HasValidLabels, SpfParameters},
 };
 use smtp_proto::*;
 use trc::SmtpEvent;

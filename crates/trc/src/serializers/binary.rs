@@ -10,6 +10,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use compact_str::format_compact;
+
 use crate::*;
 
 const VERSION: u8 = 1;
@@ -35,9 +37,11 @@ pub fn deserialize_events(bytes: &[u8]) -> crate::Result<Vec<Event<EventDetails>
             .details("EOF while reading version")
     })? != VERSION
     {
-        crate::bail!(StoreEvent::DataCorruption
-            .caused_by(crate::location!())
-            .details("Invalid version"));
+        crate::bail!(
+            StoreEvent::DataCorruption
+                .caused_by(crate::location!())
+                .details("Invalid version")
+        );
     }
     let len = leb128_read(&mut iter).ok_or_else(|| {
         StoreEvent::DataCorruption
@@ -49,7 +53,7 @@ pub fn deserialize_events(bytes: &[u8]) -> crate::Result<Vec<Event<EventDetails>
         events.push(Event::deserialize(&mut iter).ok_or_else(|| {
             StoreEvent::DataCorruption
                 .caused_by(crate::location!())
-                .details(format!("Failed to deserialize event {n}"))
+                .details(format_compact!("Failed to deserialize event {n}"))
         })?);
     }
     Ok(events)
@@ -63,9 +67,11 @@ pub fn deserialize_single_event(bytes: &[u8]) -> crate::Result<Event<EventDetail
             .details("EOF while reading version")
     })? != VERSION
     {
-        crate::bail!(StoreEvent::DataCorruption
-            .caused_by(crate::location!())
-            .details("Invalid version"));
+        crate::bail!(
+            StoreEvent::DataCorruption
+                .caused_by(crate::location!())
+                .details("Invalid version")
+        );
     }
     let _ = leb128_read(&mut iter).ok_or_else(|| {
         StoreEvent::DataCorruption
@@ -123,11 +129,6 @@ impl Event<EventDetails> {
 impl Value {
     fn serialize(&self, buf: &mut Vec<u8>) {
         match self {
-            Value::Static(v) => {
-                buf.push(0u8);
-                leb128_write(buf, v.len() as u64);
-                buf.extend(v.as_bytes());
-            }
             Value::String(v) => {
                 buf.push(0u8);
                 leb128_write(buf, v.len() as u64);
@@ -201,7 +202,7 @@ impl Value {
                 for byte in buf.iter_mut() {
                     *byte = *iter.next()?;
                 }
-                Some(Value::String(String::from_utf8(buf).ok()?))
+                Some(Value::String(CompactString::from_utf8(buf).ok()?))
             }
             1 => Some(Value::UInt(leb128_read(iter)?)),
             2 => {
@@ -347,19 +348,17 @@ impl EventType {
             EventType::Auth(AuthEvent::MissingTotp) => 36,
             EventType::Auth(AuthEvent::Success) => 37,
             EventType::Auth(AuthEvent::TooManyAttempts) => 38,
-            EventType::Cluster(ClusterEvent::DecryptionError) => 39,
-            EventType::Cluster(ClusterEvent::EmptyPacket) => 40,
-            EventType::Cluster(ClusterEvent::Error) => 41,
-            EventType::Cluster(ClusterEvent::InvalidPacket) => 42,
-            EventType::Cluster(ClusterEvent::OneOrMorePeersOffline) => 43,
-            EventType::Cluster(ClusterEvent::PeerAlive) => 44,
-            EventType::Cluster(ClusterEvent::PeerBackOnline) => 45,
-            EventType::Cluster(ClusterEvent::PeerDiscovered) => 46,
-            EventType::Cluster(ClusterEvent::PeerHasChanges) => 47,
-            EventType::Cluster(ClusterEvent::PeerLeaving) => 49,
-            EventType::Cluster(ClusterEvent::PeerOffline) => 50,
-            EventType::Cluster(ClusterEvent::PeerSuspected) => 51,
-            EventType::Cluster(ClusterEvent::PeerSuspectedIsAlive) => 52,
+            EventType::Cluster(ClusterEvent::SubscriberStart) => 39,
+            EventType::Cluster(ClusterEvent::SubscriberStop) => 40,
+            EventType::Cluster(ClusterEvent::SubscriberError) => 41,
+            EventType::Cluster(ClusterEvent::SubscriberDisconnected) => 42,
+            EventType::Cluster(ClusterEvent::PublisherStart) => 43,
+            EventType::Cluster(ClusterEvent::PublisherStop) => 44,
+            EventType::Cluster(ClusterEvent::PublisherError) => 45,
+            EventType::Cluster(ClusterEvent::MessageReceived) => 46,
+            EventType::Cluster(ClusterEvent::MessageSkipped) => 47,
+            EventType::Cluster(ClusterEvent::MessageInvalid) => 49,
+            EventType::Cluster(ClusterEvent::ClockSkewDetected) => 50,
             EventType::Config(ConfigEvent::AlreadyUpToDate) => 53,
             EventType::Config(ConfigEvent::BuildError) => 54,
             EventType::Config(ConfigEvent::BuildWarning) => 55,
@@ -866,6 +865,26 @@ impl EventType {
             EventType::Spam(SpamEvent::Pyzor) => 564,
             EventType::Queue(QueueEvent::BackPressure) => 48,
             EventType::Imap(ImapEvent::GetQuota) => 57,
+            EventType::WebDav(WebDavEvent::Propfind) => 147,
+            EventType::WebDav(WebDavEvent::Proppatch) => 148,
+            EventType::WebDav(WebDavEvent::Get) => 335,
+            EventType::WebDav(WebDavEvent::Report) => 336,
+            EventType::WebDav(WebDavEvent::Mkcol) => 376,
+            EventType::WebDav(WebDavEvent::Delete) => 458,
+            EventType::WebDav(WebDavEvent::Put) => 459,
+            EventType::WebDav(WebDavEvent::Post) => 565,
+            EventType::WebDav(WebDavEvent::Patch) => 566,
+            EventType::WebDav(WebDavEvent::Copy) => 567,
+            EventType::WebDav(WebDavEvent::Move) => 568,
+            EventType::WebDav(WebDavEvent::Lock) => 569,
+            EventType::WebDav(WebDavEvent::Unlock) => 570,
+            EventType::WebDav(WebDavEvent::Acl) => 571,
+            EventType::WebDav(WebDavEvent::Error) => 572,
+            EventType::WebDav(WebDavEvent::Options) => 573,
+            EventType::WebDav(WebDavEvent::Head) => 574,
+            EventType::WebDav(WebDavEvent::Mkcalendar) => 575,
+            EventType::Calendar(CalendarEvent::RuleExpansionError) => 576,
+            EventType::Store(StoreEvent::NatsError) => 577,
         }
     }
 
@@ -910,19 +929,17 @@ impl EventType {
             36 => Some(EventType::Auth(AuthEvent::MissingTotp)),
             37 => Some(EventType::Auth(AuthEvent::Success)),
             38 => Some(EventType::Auth(AuthEvent::TooManyAttempts)),
-            39 => Some(EventType::Cluster(ClusterEvent::DecryptionError)),
-            40 => Some(EventType::Cluster(ClusterEvent::EmptyPacket)),
-            41 => Some(EventType::Cluster(ClusterEvent::Error)),
-            42 => Some(EventType::Cluster(ClusterEvent::InvalidPacket)),
-            43 => Some(EventType::Cluster(ClusterEvent::OneOrMorePeersOffline)),
-            44 => Some(EventType::Cluster(ClusterEvent::PeerAlive)),
-            45 => Some(EventType::Cluster(ClusterEvent::PeerBackOnline)),
-            46 => Some(EventType::Cluster(ClusterEvent::PeerDiscovered)),
-            47 => Some(EventType::Cluster(ClusterEvent::PeerHasChanges)),
-            49 => Some(EventType::Cluster(ClusterEvent::PeerLeaving)),
-            50 => Some(EventType::Cluster(ClusterEvent::PeerOffline)),
-            51 => Some(EventType::Cluster(ClusterEvent::PeerSuspected)),
-            52 => Some(EventType::Cluster(ClusterEvent::PeerSuspectedIsAlive)),
+            39 => Some(EventType::Cluster(ClusterEvent::SubscriberStart)),
+            40 => Some(EventType::Cluster(ClusterEvent::SubscriberStop)),
+            41 => Some(EventType::Cluster(ClusterEvent::SubscriberError)),
+            42 => Some(EventType::Cluster(ClusterEvent::SubscriberDisconnected)),
+            43 => Some(EventType::Cluster(ClusterEvent::PublisherStart)),
+            44 => Some(EventType::Cluster(ClusterEvent::PublisherStop)),
+            45 => Some(EventType::Cluster(ClusterEvent::PublisherError)),
+            46 => Some(EventType::Cluster(ClusterEvent::MessageReceived)),
+            47 => Some(EventType::Cluster(ClusterEvent::MessageSkipped)),
+            49 => Some(EventType::Cluster(ClusterEvent::MessageInvalid)),
+            50 => Some(EventType::Cluster(ClusterEvent::ClockSkewDetected)),
             53 => Some(EventType::Config(ConfigEvent::AlreadyUpToDate)),
             54 => Some(EventType::Config(ConfigEvent::BuildError)),
             55 => Some(EventType::Config(ConfigEvent::BuildWarning)),
@@ -1469,12 +1486,32 @@ impl EventType {
             564 => Some(EventType::Spam(SpamEvent::Pyzor)),
             48 => Some(EventType::Queue(QueueEvent::BackPressure)),
             57 => Some(EventType::Imap(ImapEvent::GetQuota)),
+            147 => Some(EventType::WebDav(WebDavEvent::Propfind)),
+            148 => Some(EventType::WebDav(WebDavEvent::Proppatch)),
+            335 => Some(EventType::WebDav(WebDavEvent::Get)),
+            336 => Some(EventType::WebDav(WebDavEvent::Report)),
+            376 => Some(EventType::WebDav(WebDavEvent::Mkcol)),
+            458 => Some(EventType::WebDav(WebDavEvent::Delete)),
+            459 => Some(EventType::WebDav(WebDavEvent::Put)),
+            565 => Some(EventType::WebDav(WebDavEvent::Post)),
+            566 => Some(EventType::WebDav(WebDavEvent::Patch)),
+            567 => Some(EventType::WebDav(WebDavEvent::Copy)),
+            568 => Some(EventType::WebDav(WebDavEvent::Move)),
+            569 => Some(EventType::WebDav(WebDavEvent::Lock)),
+            570 => Some(EventType::WebDav(WebDavEvent::Unlock)),
+            571 => Some(EventType::WebDav(WebDavEvent::Acl)),
+            572 => Some(EventType::WebDav(WebDavEvent::Error)),
+            573 => Some(EventType::WebDav(WebDavEvent::Options)),
+            574 => Some(EventType::WebDav(WebDavEvent::Head)),
+            575 => Some(EventType::WebDav(WebDavEvent::Mkcalendar)),
+            576 => Some(EventType::Calendar(CalendarEvent::RuleExpansionError)),
+            577 => Some(EventType::Store(StoreEvent::NatsError)),
             _ => None,
         }
     }
 }
 
-// 147 148 335 336 376 458 459
+// 51, 52
 
 impl Key {
     fn code(&self) -> u64 {

@@ -11,7 +11,7 @@ use jmap_proto::types::{state::StateChange, type_state::DataType};
 use mail_auth::{
     dmarc::Dmarc,
     mta_sts::TlsRpt,
-    report::{tlsrpt::FailureDetails, Record},
+    report::{Record, tlsrpt::FailureDetails},
 };
 use store::{BlobStore, InMemoryStore, Store};
 use tokio::sync::mpsc;
@@ -54,6 +54,7 @@ pub enum StateEvent {
     },
     Publish {
         state_change: StateChange,
+        broadcast: bool,
     },
     UpdateSharedAccounts {
         account_id: u32,
@@ -63,6 +64,13 @@ pub enum StateEvent {
         subscriptions: Vec<UpdateSubscription>,
     },
     Stop,
+}
+
+#[derive(Debug)]
+pub enum BroadcastEvent {
+    StateChange(StateChange),
+    ReloadSettings,
+    ReloadBlockedIps,
 }
 
 #[derive(Debug)]

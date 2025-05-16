@@ -4,35 +4,37 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{sync::Arc, time::Duration};
-
-use directory::{Directory, QueryBy, Type, backend::internal::manage::ManageDirectory};
-use jmap_proto::types::{
-    blob::BlobId, collection::Collection, property::Property, state::StateChange,
-};
-use sieve::Sieve;
-use store::{
-    BitmapKey, BlobClass, BlobStore, Deserialize, FtsStore, InMemoryStore, IndexKey, IterateParams,
-    LogKey, Serialize, Store, U32_LEN, ValueKey,
-    dispatch::DocumentSet,
-    roaring::RoaringBitmap,
-    write::{
-        BatchBuilder, BitmapClass, BlobOp, DirectoryClass, QueueClass, TagValue, ValueClass,
-        key::DeserializeBigEndian, log::ChangeLogBuilder, now,
-    },
-};
-use trc::AddContext;
-use utils::BlobHash;
-
 use crate::{
-    ImapId, Inner, MailboxState, Server,
+    Inner, Server,
     auth::{AccessToken, ResourceToken, TenantInfo},
     config::smtp::{
         auth::{ArcSealer, DkimSigner, LazySignature, ResolvedSignature, build_signature},
         queue::RelayHost,
     },
-    ipc::StateEvent,
+    ipc::{BroadcastEvent, StateEvent},
 };
+use directory::{Directory, QueryBy, Type, backend::internal::manage::ManageDirectory};
+use jmap_proto::types::{
+    blob::BlobId,
+    collection::{Collection, SyncCollection},
+    property::Property,
+    state::StateChange,
+    type_state::DataType,
+};
+use sieve::Sieve;
+use std::{sync::Arc, time::Duration};
+use store::{
+    BitmapKey, BlobClass, BlobStore, Deserialize, FtsStore, InMemoryStore, IndexKey, IterateParams,
+    LogKey, SerializeInfallible, Store, U32_LEN, ValueKey,
+    dispatch::DocumentSet,
+    roaring::RoaringBitmap,
+    write::{
+        AlignedBytes, Archive, AssignedIds, BatchBuilder, BlobOp, DirectoryClass, QueueClass,
+        ValueClass, key::DeserializeBigEndian, now,
+    },
+};
+use trc::AddContext;
+use utils::BlobHash;
 
 impl Server {
     #[inline(always)]
@@ -244,7 +246,7 @@ impl Server {
             .clear(DirectoryClass::UsedQuota(account_id))
             .add(DirectoryClass::UsedQuota(account_id), quota);
         self.store()
-            .write(batch)
+            .write(batch.build_all())
             .await
             .caused_by(trc::location!())
             .map(|_| ())
@@ -348,22 +350,44 @@ impl Server {
         })
     }
 
-    pub async fn get_property<U>(
+    #[inline(always)]
+    pub async fn get_archive(
+        &self,
+        account_id: u32,
+        collection: Collection,
+        document_id: u32,
+    ) -> trc::Result<Option<Archive<AlignedBytes>>> {
+        self.core
+            .storage
+            .data
+            .get_value(ValueKey {
+                account_id,
+                collection: collection.into(),
+                document_id,
+                class: ValueClass::Property(Property::Value.into()),
+            })
+            .await
+            .add_context(|err| {
+                err.caused_by(trc::location!())
+                    .account_id(account_id)
+                    .collection(collection)
+                    .document_id(document_id)
+            })
+    }
+
+    #[inline(always)]
+    pub async fn get_archive_by_property(
         &self,
         account_id: u32,
         collection: Collection,
         document_id: u32,
         property: impl AsRef<Property> + Sync + Send,
-    ) -> trc::Result<Option<U>>
-    where
-        U: Deserialize + 'static,
-    {
+    ) -> trc::Result<Option<Archive<AlignedBytes>>> {
         let property = property.as_ref();
-
         self.core
             .storage
             .data
-            .get_value::<U>(ValueKey {
+            .get_value(ValueKey {
                 account_id,
                 collection: collection.into(),
                 document_id,
@@ -375,26 +399,21 @@ impl Server {
                     .account_id(account_id)
                     .collection(collection)
                     .document_id(document_id)
-                    .id(property.to_string())
             })
     }
 
-    pub async fn get_properties<U, I, P>(
+    pub async fn get_archives<I, CB>(
         &self,
         account_id: u32,
         collection: Collection,
-        iterate: &I,
-        property: P,
-    ) -> trc::Result<Vec<(u32, U)>>
+        documents: &I,
+        mut cb: CB,
+    ) -> trc::Result<()>
     where
         I: DocumentSet + Send + Sync,
-        P: AsRef<Property> + Sync + Send,
-        U: Deserialize + 'static,
+        CB: FnMut(u32, Archive<AlignedBytes>) -> trc::Result<bool> + Send + Sync,
     {
-        let property: u8 = property.as_ref().into();
         let collection: u8 = collection.into();
-        let expected_results = iterate.len();
-        let mut results = Vec::with_capacity(expected_results);
 
         self.core
             .storage
@@ -404,21 +423,21 @@ impl Server {
                     ValueKey {
                         account_id,
                         collection,
-                        document_id: iterate.min(),
-                        class: ValueClass::Property(property),
+                        document_id: documents.min(),
+                        class: ValueClass::Property(Property::Value.into()),
                     },
                     ValueKey {
                         account_id,
                         collection,
-                        document_id: iterate.max(),
-                        class: ValueClass::Property(property),
+                        document_id: documents.max(),
+                        class: ValueClass::Property(Property::Value.into()),
                     },
                 ),
                 |key, value| {
                     let document_id = key.deserialize_be_u32(key.len() - U32_LEN)?;
-                    if iterate.contains(document_id) {
-                        results.push((document_id, U::deserialize(value)?));
-                        Ok(expected_results == 0 || results.len() < expected_results)
+                    if documents.contains(document_id) {
+                        <Archive<AlignedBytes> as Deserialize>::deserialize(value)
+                            .and_then(|archive| cb(document_id, archive))
                     } else {
                         Ok(true)
                     }
@@ -429,11 +448,10 @@ impl Server {
                 err.caused_by(trc::location!())
                     .account_id(account_id)
                     .collection(collection)
-                    .id(property.to_string())
             })
-            .map(|_| results)
     }
 
+    #[inline(always)]
     pub async fn get_document_ids(
         &self,
         account_id: u32,
@@ -451,35 +469,7 @@ impl Server {
             })
     }
 
-    pub async fn get_tag(
-        &self,
-        account_id: u32,
-        collection: Collection,
-        property: impl AsRef<Property> + Sync + Send,
-        value: impl Into<TagValue<u32>> + Sync + Send,
-    ) -> trc::Result<Option<RoaringBitmap>> {
-        let property = property.as_ref();
-        self.core
-            .storage
-            .data
-            .get_bitmap(BitmapKey {
-                account_id,
-                collection: collection.into(),
-                class: BitmapClass::Tag {
-                    field: property.into(),
-                    value: value.into(),
-                },
-                document_id: 0,
-            })
-            .await
-            .add_context(|err| {
-                err.caused_by(trc::location!())
-                    .account_id(account_id)
-                    .collection(collection)
-                    .id(property.to_string())
-            })
-    }
-
+    #[inline(always)]
     pub fn notify_task_queue(&self) {
         self.inner.ipc.index_tx.notify_one();
     }
@@ -504,44 +494,39 @@ impl Server {
             .map(|_| total)
     }
 
-    pub fn begin_changes(&self, account_id: u32) -> trc::Result<ChangeLogBuilder> {
-        self.assign_change_id(account_id)
-            .map(ChangeLogBuilder::with_change_id)
-    }
-
     #[inline(always)]
-    pub fn assign_change_id(&self, _: u32) -> trc::Result<u64> {
-        self.generate_snowflake_id()
+    pub fn generate_snowflake_id(&self) -> u64 {
+        self.inner.data.jmap_id_gen.generate()
     }
 
-    pub fn generate_snowflake_id(&self) -> trc::Result<u64> {
-        self.inner.data.jmap_id_gen.generate().ok_or_else(|| {
-            trc::StoreEvent::UnexpectedError
-                .into_err()
-                .caused_by(trc::location!())
-                .ctx(trc::Key::Reason, "Failed to generate snowflake id.")
-        })
-    }
+    pub async fn commit_batch(&self, mut builder: BatchBuilder) -> trc::Result<AssignedIds> {
+        let mut assigned_ids = AssignedIds::default();
 
-    pub async fn commit_changes(
-        &self,
-        account_id: u32,
-        mut changes: ChangeLogBuilder,
-    ) -> trc::Result<u64> {
-        if changes.change_id == u64::MAX || changes.change_id == 0 {
-            changes.change_id = self.assign_change_id(account_id)?;
+        for batch in builder.build() {
+            assigned_ids = self.store().write(batch).await?;
         }
-        let state = changes.change_id;
 
-        let mut builder = BatchBuilder::new();
-        builder.with_account_id(account_id).custom(changes);
-        self.core
-            .storage
-            .data
-            .write(builder.build())
-            .await
-            .caused_by(trc::location!())
-            .map(|_| state)
+        if let Some(changes) = builder.changes() {
+            for (account_id, changed_collections) in changes {
+                let mut state_change = StateChange::new(account_id, changed_collections.change_id);
+                for changed_collection in changed_collections.changed_containers {
+                    if let Some(data_type) = DataType::try_from_id(changed_collection, true) {
+                        state_change.set_change(data_type);
+                    }
+                }
+                for changed_collection in changed_collections.changed_items {
+                    if let Some(data_type) = DataType::try_from_id(changed_collection, false) {
+                        state_change.set_change(data_type);
+                    }
+                }
+                if state_change.has_changes() {
+                    self.broadcast_state_change(state_change).await;
+                }
+                assigned_ids.change_id = changed_collections.change_id.into();
+            }
+        }
+
+        Ok(assigned_ids)
     }
 
     pub async fn delete_changes(&self, account_id: u32, before: Duration) -> trc::Result<()> {
@@ -552,11 +537,14 @@ impl Server {
         })?;
 
         for collection in [
-            Collection::Email,
-            Collection::Mailbox,
-            Collection::Thread,
-            Collection::Identity,
-            Collection::EmailSubmission,
+            SyncCollection::Email.into(),
+            SyncCollection::Thread.into(),
+            SyncCollection::Identity.into(),
+            SyncCollection::EmailSubmission.into(),
+            SyncCollection::SieveScript.into(),
+            SyncCollection::FileNode.into(),
+            SyncCollection::AddressBook.into(),
+            SyncCollection::Calendar.into(),
         ] {
             self.core
                 .storage
@@ -564,12 +552,12 @@ impl Server {
                 .delete_range(
                     LogKey {
                         account_id,
-                        collection: collection.into(),
+                        collection,
                         change_id: 0,
                     },
                     LogKey {
                         account_id,
-                        collection: collection.into(),
+                        collection,
                         change_id: reference_cid,
                     },
                 )
@@ -585,7 +573,10 @@ impl Server {
             .ipc
             .state_tx
             .clone()
-            .send(StateEvent::Publish { state_change })
+            .send(StateEvent::Publish {
+                state_change,
+                broadcast: true,
+            })
             .await
         {
             Ok(_) => true,
@@ -601,6 +592,18 @@ impl Server {
         }
     }
 
+    pub async fn cluster_broadcast(&self, event: BroadcastEvent) {
+        if let Some(broadcast_tx) = &self.inner.ipc.broadcast_tx.clone() {
+            if broadcast_tx.send(event).await.is_err() {
+                trc::event!(
+                    Server(trc::ServerEvent::ThreadError),
+                    Details = "Error sending broadcast event.",
+                    CausedBy = trc::location!()
+                );
+            }
+        }
+    }
+
     #[allow(clippy::blocks_in_conditions)]
     pub async fn put_blob(
         &self,
@@ -609,7 +612,7 @@ impl Server {
         set_quota: bool,
     ) -> trc::Result<BlobId> {
         // First reserve the hash
-        let hash = BlobHash::from(data);
+        let hash = BlobHash::generate(data);
         let mut batch = BatchBuilder::new();
         let until = now() + self.core.jmap.upload_tmp_ttl;
 
@@ -623,7 +626,7 @@ impl Server {
         self.core
             .storage
             .data
-            .write(batch.build())
+            .write(batch.build_all())
             .await
             .caused_by(trc::location!())?;
 
@@ -649,7 +652,7 @@ impl Server {
             self.core
                 .storage
                 .data
-                .write(batch.build())
+                .write(batch.build_all())
                 .await
                 .caused_by(trc::location!())?;
         }
@@ -688,23 +691,6 @@ impl BuildServer for Arc<Inner> {
         Server {
             inner: self.clone(),
             core: self.shared_core.load_full(),
-        }
-    }
-}
-
-impl MailboxState {
-    pub fn map_result_id(&self, document_id: u32, is_uid: bool) -> Option<(u32, ImapId)> {
-        if let Some(imap_id) = self.id_to_imap.get(&document_id) {
-            Some((if is_uid { imap_id.uid } else { imap_id.seqnum }, *imap_id))
-        } else if is_uid {
-            self.next_state.as_ref().and_then(|s| {
-                s.next_state
-                    .id_to_imap
-                    .get(&document_id)
-                    .map(|imap_id| (imap_id.uid, *imap_id))
-            })
-        } else {
-            None
         }
     }
 }

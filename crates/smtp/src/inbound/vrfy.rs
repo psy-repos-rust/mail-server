@@ -5,6 +5,7 @@
  */
 
 use common::listener::SessionStream;
+
 use trc::SmtpEvent;
 
 use crate::core::Session;

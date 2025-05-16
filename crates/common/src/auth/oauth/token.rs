@@ -6,7 +6,7 @@
 
 use std::time::SystemTime;
 
-use directory::{QueryBy, backend::internal::PrincipalField};
+use directory::QueryBy;
 use mail_builder::encoders::base64::base64_encode;
 use mail_parser::decoders::base64::base64_decode;
 use store::{
@@ -52,7 +52,7 @@ impl Server {
                 .await
                 .caused_by(trc::location!())?
         } else {
-            String::new()
+            "".into()
         };
 
         let key = &self.core.oauth.oauth_key;
@@ -161,7 +161,7 @@ impl Server {
                 .await
                 .map_err(|err| trc::AuthEvent::Error.into_err().ctx(trc::Key::Details, err))?
         } else {
-            String::new()
+            "".into()
         };
 
         // Build context
@@ -228,8 +228,7 @@ impl Server {
                         .into_err()
                         .details("Account no longer exists")
                 })?
-                .take_str_array(PrincipalField::Secrets)
-                .unwrap_or_default()
+                .secrets
                 .into_iter()
                 .next()
                 .ok_or(
@@ -239,7 +238,7 @@ impl Server {
                         .caused_by(trc::location!()),
                 )
         } else if let Some((_, secret)) = &self.core.jmap.fallback_admin {
-            Ok(secret.clone())
+            Ok(secret.into())
         } else {
             Err(trc::AuthEvent::Error
                 .into_err()

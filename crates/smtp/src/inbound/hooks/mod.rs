@@ -8,6 +8,7 @@ pub mod client;
 pub mod message;
 
 use ahash::AHashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]

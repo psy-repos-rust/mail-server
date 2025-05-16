@@ -7,11 +7,11 @@
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use common::{
-    config::server::ServerProtocol,
-    listener::{limiter::ConcurrencyLimiter, ServerInstance, SessionStream, TcpAcceptor},
     Server,
+    config::server::ServerProtocol,
+    listener::{ServerInstance, SessionStream, TcpAcceptor, limiter::ConcurrencyLimiter},
 };
-use rustls::{server::ResolvesServerCert, ServerConfig};
+use rustls::{ServerConfig, server::ResolvesServerCert};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::watch,
@@ -116,7 +116,7 @@ impl TestSession for Session<DummyIo> {
                 0,
             ),
             params: SessionParameters::default(),
-            hostname: "localhost".to_string(),
+            hostname: "localhost".into(),
         }
     }
 
@@ -223,43 +223,43 @@ impl TestSession for Session<DummyIo> {
         let message = self
             .build_message(
                 SessionAddress {
-                    address: "bill@foobar.org".to_string(),
-                    address_lcase: "bill@foobar.org".to_string(),
-                    domain: "foobar.org".to_string(),
+                    address: "bill@foobar.org".into(),
+                    address_lcase: "bill@foobar.org".into(),
+                    domain: "foobar.org".into(),
                     flags: 123,
-                    dsn_info: "envelope1".to_string().into(),
+                    dsn_info: Some("envelope1".into()),
                 },
                 vec![
                     SessionAddress {
-                        address: "a@foobar.org".to_string(),
-                        address_lcase: "a@foobar.org".to_string(),
-                        domain: "foobar.org".to_string(),
+                        address: "a@foobar.org".into(),
+                        address_lcase: "a@foobar.org".into(),
+                        domain: "foobar.org".into(),
                         flags: 1,
                         dsn_info: None,
                     },
                     SessionAddress {
-                        address: "b@test.net".to_string(),
-                        address_lcase: "b@test.net".to_string(),
-                        domain: "test.net".to_string(),
+                        address: "b@test.net".into(),
+                        address_lcase: "b@test.net".into(),
+                        domain: "test.net".into(),
                         flags: 2,
                         dsn_info: None,
                     },
                     SessionAddress {
-                        address: "c@foobar.org".to_string(),
-                        address_lcase: "c@foobar.org".to_string(),
-                        domain: "foobar.org".to_string(),
+                        address: "c@foobar.org".into(),
+                        address_lcase: "c@foobar.org".into(),
+                        domain: "foobar.org".into(),
                         flags: 3,
                         dsn_info: None,
                     },
                     SessionAddress {
-                        address: "d@test.net".to_string(),
-                        address_lcase: "d@test.net".to_string(),
-                        domain: "test.net".to_string(),
+                        address: "d@test.net".into(),
+                        address_lcase: "d@test.net".into(),
+                        domain: "test.net".into(),
                         flags: 4,
                         dsn_info: None,
                     },
                 ],
-                self.server.inner.data.queue_id_gen.generate().unwrap(),
+                self.server.inner.data.queue_id_gen.generate(),
                 0,
             )
             .await;

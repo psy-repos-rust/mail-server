@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use compact_str::ToCompactString;
+
 use crate::{
     method::{
         changes::ChangesRequest,
@@ -21,15 +23,15 @@ use crate::{
         upload::BlobUploadRequest,
         validate::ValidateSieveScriptRequest,
     },
-    parser::{json::Parser, Ignore, JsonObjectParser, Token},
+    parser::{Ignore, JsonObjectParser, Token, json::Parser},
     types::any_id::AnyId,
 };
 
 use super::{
+    Call, Request, RequestMethod,
     capability::Capability,
     echo::Echo,
     method::{MethodFunction, MethodName, MethodObject},
-    Call, Request, RequestMethod,
 };
 
 impl Request {
@@ -177,7 +179,7 @@ impl Request {
                             }
                             _ => Err(trc::JmapEvent::UnknownMethod
                                 .into_err()
-                                .details(method_name.to_string())),
+                                .details(method_name.to_compact_string())),
                         };
 
                         let method = match method {

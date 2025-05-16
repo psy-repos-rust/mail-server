@@ -91,14 +91,11 @@ mod tests {
     fn serialize_status() {
         let mut buf = Vec::new();
         StatusItem {
-            mailbox_name: "blurdybloop".to_string(),
+            mailbox_name: "blurdybloop".into(),
             items: vec![
                 (Status::Messages, StatusItemType::Number(231)),
                 (Status::UidNext, StatusItemType::Number(44292)),
-                (
-                    Status::MailboxId,
-                    StatusItemType::String("abc-123".to_string()),
-                ),
+                (Status::MailboxId, StatusItemType::String("abc-123".into())),
             ],
         }
         .serialize(&mut buf, true);

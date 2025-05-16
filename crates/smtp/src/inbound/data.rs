@@ -18,10 +18,11 @@ use common::{
     psl,
     scripts::ScriptModification,
 };
+
 use mail_auth::{
+    AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, ReceivedSpf,
     common::{headers::HeaderWriter, verify::VerifySignature},
     dmarc::{self, verify::DmarcParameters},
-    AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, ReceivedSpf,
 };
 use mail_builder::headers::{date::Date, message_id::generate_message_id_header};
 use mail_parser::MessageParser;
@@ -36,7 +37,7 @@ use utils::config::Rate;
 use crate::{
     core::{Session, SessionAddress, State},
     inbound::milter::Modification,
-    queue::{self, quota::HasQueueQuota, Message, MessageSource, QueueEnvelope, Schedule},
+    queue::{self, Message, MessageSource, QueueEnvelope, Schedule, quota::HasQueueQuota},
     reporting::analysis::AnalyzeReport,
     scripts::ScriptResult,
 };
@@ -363,13 +364,7 @@ impl<T: SessionStream> Session<T> {
         }
 
         // Add Received header
-        let message_id = self
-            .server
-            .inner
-            .data
-            .queue_id_gen
-            .generate()
-            .unwrap_or_else(now);
+        let message_id = self.server.inner.data.queue_id_gen.generate();
         let mut headers = Vec::with_capacity(64);
         if self
             .server
@@ -417,9 +412,11 @@ impl<T: SessionStream> Session<T> {
                         set.write_header(&mut headers);
                     }
                     Err(err) => {
-                        trc::error!(trc::Error::from(err)
-                            .span_id(self.data.session_id)
-                            .details("Failed to ARC seal message"));
+                        trc::error!(
+                            trc::Error::from(err)
+                                .span_id(self.data.session_id)
+                                .details("Failed to ARC seal message")
+                        );
                     }
                 }
             }
@@ -567,7 +564,7 @@ impl<T: SessionStream> Session<T> {
                     modifications
                 }
                 ScriptResult::Reject(message) => {
-                    return message.into_bytes().into();
+                    return message.as_bytes().to_vec().into();
                 }
                 ScriptResult::Discard => {
                     return (b"250 2.0.0 Message queued for delivery.\r\n"[..]).into();
@@ -649,16 +646,18 @@ impl<T: SessionStream> Session<T> {
                         signature.write_header(&mut headers);
                     }
                     Err(err) => {
-                        trc::error!(trc::Error::from(err)
-                            .span_id(self.data.session_id)
-                            .details("Failed to DKIM sign message"));
+                        trc::error!(
+                            trc::Error::from(err)
+                                .span_id(self.data.session_id)
+                                .details("Failed to DKIM sign message")
+                        );
                     }
                 }
             }
         }
 
         // Update size
-        message.size = raw_message.len() + headers.len();
+        message.size = (raw_message.len() + headers.len()) as u64;
 
         // Verify queue quota
         if self.server.has_quota(&mut message).await {
@@ -727,7 +726,7 @@ impl<T: SessionStream> Session<T> {
             if message
                 .domains
                 .last()
-                .is_none_or( |d| d.domain != rcpt.domain)
+                .is_none_or(|d| d.domain != rcpt.domain)
             {
                 let rcpt_idx = message.domains.len();
                 message.domains.push(queue::Domain {
@@ -822,7 +821,7 @@ impl<T: SessionStream> Session<T> {
                 } else {
                     rcpt.flags | RCPT_NOTIFY_DELAY | RCPT_NOTIFY_FAILURE
                 },
-                domain_idx: message.domains.len() - 1,
+                domain_idx: (message.domains.len() - 1) as u32,
                 orcpt: rcpt.dsn_info,
             });
         }

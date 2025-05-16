@@ -6,15 +6,19 @@
 
 use std::path::PathBuf;
 
-use email::crypto::{
-    try_parse_certs, Algorithm, EncryptMessage, EncryptionMethod, EncryptionParams, EncryptionType,
+use email::message::crypto::{
+    Algorithm, EncryptMessage, EncryptionMethod, EncryptionParams, EncryptionType, try_parse_certs,
 };
 use jmap_proto::types::id::Id;
 use mail_parser::{MessageParser, MimeHeaders};
+use store::{
+    Deserialize, Serialize,
+    write::{Archive, Archiver},
+};
 
 use crate::{
     directory::internal::TestInternalDirectory,
-    jmap::{delivery::SmtpConnection, ManagementApi},
+    jmap::{ManagementApi, delivery::SmtpConnection},
 };
 
 use super::JMAPTest;
@@ -213,22 +217,30 @@ pub async fn import_certs_and_encrypt() {
                 .unwrap();
             assert!(!message.is_encrypted());
             params.algo = algo;
-            message.encrypt(&params).await.unwrap();
+            let arch =
+                Archive::deserialize_owned(Archiver::new(params.clone()).serialize().unwrap())
+                    .unwrap();
+            message
+                .encrypt(arch.unarchive::<EncryptionParams>().unwrap())
+                .await
+                .unwrap();
         }
     }
 
     // S/MIME and PGP should not be allowed mixed
-    assert!(try_parse_certs(
-        EncryptionMethod::PGP,
-        std::fs::read(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("crypto")
-                .join("cert_mixed.pem"),
+    assert!(
+        try_parse_certs(
+            EncryptionMethod::PGP,
+            std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("resources")
+                    .join("crypto")
+                    .join("cert_mixed.pem"),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .is_err());
+        .is_err()
+    );
 }
 
 #[test]
