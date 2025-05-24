@@ -11,10 +11,10 @@ pub mod oidc;
 pub mod smtp;
 pub mod sql;
 
-use common::{config::smtp::session::AddressMapping, Core, Server};
+use common::{Core, Server, config::smtp::session::AddressMapping};
 use directory::{
-    backend::internal::{manage::ManageDirectory, PrincipalField},
     Directories, Principal, Type,
+    backend::internal::{PrincipalField, PrincipalSet, manage::ManageDirectory},
 };
 use mail_send::Credentials;
 use rustls::ServerConfig;
@@ -24,7 +24,7 @@ use std::{borrow::Cow, io::BufReader, sync::Arc};
 use store::{Store, Stores};
 use tokio_rustls::TlsAcceptor;
 
-use crate::{store::TempDir, AssertConfig};
+use crate::{AssertConfig, store::TempDir};
 
 const CONFIG: &str = r#"
 [directory."rocksdb"]
@@ -362,6 +362,7 @@ impl DirectoryTest {
             true,
         )
         .await;
+
         config.assert_no_errors();
 
         // Enable catch-all and subaddressing
@@ -493,6 +494,12 @@ trait IntoTestPrincipal {
     fn into_test(self) -> TestPrincipal;
 }
 
+impl IntoTestPrincipal for PrincipalSet {
+    fn into_test(self) -> TestPrincipal {
+        TestPrincipal::from(self)
+    }
+}
+
 impl IntoTestPrincipal for Principal {
     fn into_test(self) -> TestPrincipal {
         TestPrincipal::from(self)
@@ -507,8 +514,8 @@ impl TestPrincipal {
     }
 }
 
-impl From<Principal> for TestPrincipal {
-    fn from(mut value: Principal) -> Self {
+impl From<PrincipalSet> for TestPrincipal {
+    fn from(mut value: PrincipalSet) -> Self {
         Self {
             id: value.id(),
             typ: value.typ(),
@@ -534,9 +541,26 @@ impl From<Principal> for TestPrincipal {
     }
 }
 
-impl From<TestPrincipal> for Principal {
+impl From<Principal> for TestPrincipal {
+    fn from(value: Principal) -> Self {
+        Self {
+            id: value.id(),
+            typ: value.typ(),
+            quota: value.quota(),
+            member_of: value.member_of().iter().map(|v| v.to_string()).collect(),
+            roles: value.roles().iter().map(|v| v.to_string()).collect(),
+            lists: value.lists().iter().map(|v| v.to_string()).collect(),
+            name: value.name,
+            secrets: value.secrets,
+            emails: value.emails,
+            description: value.description,
+        }
+    }
+}
+
+impl From<TestPrincipal> for PrincipalSet {
     fn from(value: TestPrincipal) -> Self {
-        Principal::new(value.id, value.typ)
+        PrincipalSet::new(value.id, value.typ)
             .with_field(PrincipalField::Name, value.name)
             .with_field(PrincipalField::Quota, value.quota)
             .with_field(PrincipalField::Secrets, value.secrets)

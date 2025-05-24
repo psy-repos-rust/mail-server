@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use deadpool::managed;
-use ldap3::{exop::WhoAmI, Ldap, LdapConnAsync, LdapError};
+use ldap3::{Ldap, LdapConnAsync, LdapError, exop::WhoAmI};
 
 use super::LdapConnectionManager;
 
@@ -26,7 +26,7 @@ impl managed::Manager for LdapConnectionManager {
             Details = self
                 .bind_dn
                 .as_ref()
-                .map(|b| trc::Value::String(b.dn.clone())),
+                .map(|b| trc::Value::String(b.dn.as_str().into())),
         );
 
         if let Some(bind) = &self.bind_dn {

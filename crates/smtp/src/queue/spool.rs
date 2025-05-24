@@ -6,19 +6,22 @@
 
 use crate::queue::DomainPart;
 use common::ipc::QueueEvent;
-use common::{Server, KV_LOCK_QUEUE_MESSAGE};
+use common::{KV_LOCK_QUEUE_MESSAGE, Server};
+
 use std::borrow::Cow;
 use std::future::Future;
 use std::time::{Duration, SystemTime};
 use store::write::key::DeserializeBigEndian;
-use store::write::{now, BatchBuilder, Bincode, BlobOp, QueueClass, ValueClass};
-use store::{IterateParams, Serialize, ValueKey, U64_LEN};
+use store::write::{
+    AlignedBytes, Archive, Archiver, BatchBuilder, BlobOp, QueueClass, ValueClass, now,
+};
+use store::{IterateParams, Serialize, SerializeInfallible, U64_LEN, ValueKey};
 use trc::ServerEvent;
 use utils::BlobHash;
 
 use super::{
-    Domain, Message, MessageSource, QueueEnvelope, QueueId, QueuedMessage, QuotaKey, Recipient,
-    Schedule, Status,
+    ArchivedMessage, ArchivedStatus, Domain, Message, MessageSource, QueueEnvelope, QueueId,
+    QueuedMessage, QuotaKey, Recipient, Schedule, Status,
 };
 
 pub const LOCK_EXPIRY: u64 = 300;
@@ -40,6 +43,11 @@ pub trait SmtpSpool: Sync + Send {
     fn unlock_event(&self, queue_id: QueueId) -> impl Future<Output = ()> + Send;
 
     fn read_message(&self, id: QueueId) -> impl Future<Output = Option<Message>> + Send;
+
+    fn read_message_archive(
+        &self,
+        id: QueueId,
+    ) -> impl Future<Output = trc::Result<Option<Archive<AlignedBytes>>>> + Send;
 }
 
 impl SmtpSpool for Server {
@@ -54,7 +62,7 @@ impl SmtpSpool for Server {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         Message {
-            queue_id: self.inner.data.queue_id_gen.generate().unwrap_or(created),
+            queue_id: self.inner.data.queue_id_gen.generate(),
             span_id,
             created,
             return_path: return_path.into(),
@@ -104,9 +112,10 @@ impl SmtpSpool for Server {
             .await;
 
         if let Err(err) = result {
-            trc::error!(err
-                .details("Failed to read queue.")
-                .caused_by(trc::location!()));
+            trc::error!(
+                err.details("Failed to read queue.")
+                    .caused_by(trc::location!())
+            );
         }
 
         events
@@ -125,9 +134,10 @@ impl SmtpSpool for Server {
                 result
             }
             Err(err) => {
-                trc::error!(err
-                    .details("Failed to lock event.")
-                    .caused_by(trc::location!()));
+                trc::error!(
+                    err.details("Failed to lock event.")
+                        .caused_by(trc::location!())
+                );
                 false
             }
         }
@@ -139,30 +149,40 @@ impl SmtpSpool for Server {
             .remove_lock(KV_LOCK_QUEUE_MESSAGE, &queue_id.to_be_bytes())
             .await
         {
-            trc::error!(err
-                .details("Failed to unlock event.")
-                .caused_by(trc::location!()));
+            trc::error!(
+                err.details("Failed to unlock event.")
+                    .caused_by(trc::location!())
+            );
         }
     }
 
     async fn read_message(&self, id: QueueId) -> Option<Message> {
-        match self
-            .store()
-            .get_value::<Bincode<Message>>(ValueKey::from(ValueClass::Queue(QueueClass::Message(
-                id,
-            ))))
-            .await
-        {
-            Ok(Some(message)) => Some(message.inner),
+        match self.read_message_archive(id).await.and_then(|a| match a {
+            Some(a) => a.deserialize::<Message>().map(Some),
+            None => Ok(None),
+        }) {
+            Ok(Some(message)) => Some(message),
             Ok(None) => None,
             Err(err) => {
-                trc::error!(err
-                    .details("Failed to read message.")
-                    .caused_by(trc::location!()));
+                trc::error!(
+                    err.details("Failed to read message.")
+                        .caused_by(trc::location!())
+                );
 
                 None
             }
         }
+    }
+
+    async fn read_message_archive(
+        &self,
+        id: QueueId,
+    ) -> trc::Result<Option<Archive<AlignedBytes>>> {
+        self.store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::from(ValueClass::Queue(
+                QueueClass::Message(id),
+            )))
+            .await
     }
 }
 
@@ -184,11 +204,11 @@ impl Message {
         } else {
             raw_message.into()
         };
-        self.blob_hash = BlobHash::from(message.as_ref());
+        self.blob_hash = BlobHash::generate(message.as_ref());
 
         // Generate id
         if self.size == 0 {
-            self.size = message.len();
+            self.size = message.len() as u64;
         }
 
         // Reserve and write blob
@@ -201,11 +221,12 @@ impl Message {
             },
             0u32.serialize(),
         );
-        if let Err(err) = server.store().write(batch.build()).await {
-            trc::error!(err
-                .details("Failed to write to store.")
-                .span_id(session_id)
-                .caused_by(trc::location!()));
+        if let Err(err) = server.store().write(batch.build_all()).await {
+            trc::error!(
+                err.details("Failed to write to store.")
+                    .span_id(session_id)
+                    .caused_by(trc::location!())
+            );
 
             return false;
         }
@@ -214,10 +235,11 @@ impl Message {
             .put_blob(self.blob_hash.as_slice(), message.as_ref())
             .await
         {
-            trc::error!(err
-                .details("Failed to write blob.")
-                .span_id(session_id)
-                .caused_by(trc::location!()));
+            trc::error!(
+                err.details("Failed to write blob.")
+                    .span_id(session_id)
+                    .caused_by(trc::location!())
+            );
 
             return false;
         }
@@ -233,14 +255,14 @@ impl Message {
             SpanId = session_id,
             QueueId = self.queue_id,
             From = if !self.return_path.is_empty() {
-                trc::Value::String(self.return_path.to_string())
+                trc::Value::String(self.return_path.as_str().into())
             } else {
-                trc::Value::Static("<>")
+                trc::Value::String("<>".into())
             },
             To = self
                 .recipients
                 .iter()
-                .map(|r| trc::Value::String(r.address_lcase.clone()))
+                .map(|r| trc::Value::String(r.address_lcase.as_str().into()))
                 .collect::<Vec<_>>(),
             Size = self.size,
             NextRetry = trc::Value::Timestamp(self.next_delivery_event()),
@@ -292,14 +314,25 @@ impl Message {
             )
             .set(
                 ValueClass::Queue(QueueClass::Message(self.queue_id)),
-                Bincode::new(self).serialize(),
+                match Archiver::new(self).serialize() {
+                    Ok(data) => data,
+                    Err(err) => {
+                        trc::error!(
+                            err.details("Failed to serialize message.")
+                                .span_id(session_id)
+                                .caused_by(trc::location!())
+                        );
+                        return false;
+                    }
+                },
             );
 
-        if let Err(err) = server.store().write(batch.build()).await {
-            trc::error!(err
-                .details("Failed to write to store.")
-                .span_id(session_id)
-                .caused_by(trc::location!()));
+        if let Err(err) = server.store().write(batch.build_all()).await {
+            trc::error!(
+                err.details("Failed to write to store.")
+                    .span_id(session_id)
+                    .caused_by(trc::location!())
+            );
 
             return false;
         }
@@ -363,7 +396,7 @@ impl Message {
                 idx
             };
         self.recipients.push(Recipient {
-            domain_idx,
+            domain_idx: domain_idx as u32,
             address: rcpt.into(),
             address_lcase: rcpt_lcase.into(),
             status: Status::Scheduled,
@@ -413,14 +446,25 @@ impl Message {
         let span_id = self.span_id;
         batch.set(
             ValueClass::Queue(QueueClass::Message(self.queue_id)),
-            Bincode::new(self).serialize(),
+            match Archiver::new(self).serialize() {
+                Ok(data) => data,
+                Err(err) => {
+                    trc::error!(
+                        err.details("Failed to serialize message.")
+                            .span_id(span_id)
+                            .caused_by(trc::location!())
+                    );
+                    return false;
+                }
+            },
         );
 
-        if let Err(err) = server.store().write(batch.build()).await {
-            trc::error!(err
-                .details("Failed to save changes.")
-                .span_id(span_id)
-                .caused_by(trc::location!()));
+        if let Err(err) = server.store().write(batch.build_all()).await {
+            trc::error!(
+                err.details("Failed to save changes.")
+                    .span_id(span_id)
+                    .caused_by(trc::location!())
+            );
             false
         } else {
             true
@@ -458,11 +502,12 @@ impl Message {
             )))
             .clear(ValueClass::Queue(QueueClass::Message(self.queue_id)));
 
-        if let Err(err) = server.store().write(batch.build()).await {
-            trc::error!(err
-                .details("Failed to write to update queue.")
-                .span_id(self.span_id)
-                .caused_by(trc::location!()));
+        if let Err(err) = server.store().write(batch.build_all()).await {
+            trc::error!(
+                err.details("Failed to write to update queue.")
+                    .span_id(self.span_id)
+                    .caused_by(trc::location!())
+            );
             false
         } else {
             true
@@ -474,6 +519,40 @@ impl Message {
             || self
                 .return_path
                 .rsplit_once('@')
-                .is_some_and(|(_, domain)| domains.contains(&domain.to_string()))
+                .is_some_and(|(_, domain)| domains.iter().any(|dd| dd == domain))
+    }
+}
+
+impl ArchivedMessage {
+    pub fn has_domain(&self, domains: &[String]) -> bool {
+        self.domains
+            .iter()
+            .any(|d| domains.iter().any(|dd| dd == d.domain.as_str()))
+            || self
+                .return_path
+                .rsplit_once('@')
+                .is_some_and(|(_, domain)| domains.iter().any(|dd| dd == domain))
+    }
+
+    pub fn next_delivery_event(&self) -> u64 {
+        let mut next_delivery = now();
+
+        for (pos, domain) in self
+            .domains
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.status,
+                    ArchivedStatus::Scheduled | ArchivedStatus::TemporaryFailure(_)
+                )
+            })
+            .enumerate()
+        {
+            if pos == 0 || domain.retry.due < next_delivery {
+                next_delivery = domain.retry.due.into();
+            }
+        }
+
+        next_delivery
     }
 }

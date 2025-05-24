@@ -5,23 +5,23 @@
  */
 
 use foundationdb::{
+    KeySelector, RangeOption, Transaction,
     future::FdbSlice,
     options::{self, StreamingMode},
-    KeySelector, RangeOption, Transaction,
 };
 use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 
 use crate::{
+    BitmapKey, Deserialize, IterateParams, Key, U32_LEN, ValueKey, WITH_SUBSPACE,
     backend::deserialize_i64_le,
     write::{
-        key::{DeserializeBigEndian, KeySerializer},
         BitmapClass, ValueClass,
+        key::{DeserializeBigEndian, KeySerializer},
     },
-    BitmapKey, Deserialize, IterateParams, Key, ValueKey, U32_LEN, WITH_SUBSPACE,
 };
 
-use super::{into_error, FdbStore, ReadVersion, TimedTransaction, MAX_VALUE_SIZE};
+use super::{FdbStore, MAX_VALUE_SIZE, ReadVersion, TimedTransaction, into_error};
 
 #[allow(dead_code)]
 pub(crate) enum ChunkedValue {
@@ -40,14 +40,14 @@ impl FdbStore {
 
         match read_chunked_value(&key, &trx, true).await? {
             ChunkedValue::Single(bytes) => U::deserialize(&bytes).map(Some),
-            ChunkedValue::Chunked { bytes, .. } => U::deserialize(&bytes).map(Some),
+            ChunkedValue::Chunked { bytes, .. } => U::deserialize_owned(bytes).map(Some),
             ChunkedValue::None => Ok(None),
         }
     }
 
     pub(crate) async fn get_bitmap(
         &self,
-        mut key: BitmapKey<BitmapClass<u32>>,
+        mut key: BitmapKey<BitmapClass>,
     ) -> trc::Result<Option<RoaringBitmap>> {
         let mut bm = RoaringBitmap::new();
         let begin = key.serialize(WITH_SUBSPACE);
@@ -150,7 +150,7 @@ impl FdbStore {
 
     pub(crate) async fn get_counter(
         &self,
-        key: impl Into<ValueKey<ValueClass<u32>>> + Sync + Send,
+        key: impl Into<ValueKey<ValueClass>> + Sync + Send,
     ) -> trc::Result<i64> {
         let key = key.into().serialize(WITH_SUBSPACE);
         if let Some(bytes) = self

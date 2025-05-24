@@ -7,18 +7,18 @@
 use std::{sync::Arc, time::Instant};
 
 use directory::Permission;
-use email::ingest::{EmailIngest, IngestEmail, IngestSource};
+use email::message::ingest::{EmailIngest, IngestEmail, IngestSource};
 use imap_proto::{
+    Command, ResponseCode, StatusResponse,
     protocol::{append::Arguments, select::HighestModSeq},
     receiver::Request,
-    Command, ResponseCode, StatusResponse,
 };
 
 use crate::{
-    core::{ImapUidToId, SelectedMailbox, Session, SessionData},
+    core::{ImapUidToId, MailboxId, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-use common::{listener::SessionStream, MailboxId};
+use common::listener::SessionStream;
 use jmap_proto::types::{acl::Acl, keyword::Keyword, state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
 
@@ -145,10 +145,10 @@ impl<T: SessionStream> SessionData<T> {
         if let Some(change_id) = last_change_id {
             self.server
                 .broadcast_state_change(
-                    StateChange::new(account_id)
-                        .with_change(DataType::Email, change_id)
-                        .with_change(DataType::Mailbox, change_id)
-                        .with_change(DataType::Thread, change_id),
+                    StateChange::new(account_id, change_id)
+                        .with_change(DataType::Email)
+                        .with_change(DataType::Mailbox)
+                        .with_change(DataType::Thread),
                 )
                 .await;
         }
@@ -168,23 +168,25 @@ impl<T: SessionStream> SessionData<T> {
 
         if !created_ids.is_empty() {
             let uids = created_ids.iter().map(|id| id.uid).collect();
-            let uid_validity = match selected_mailbox {
+            match selected_mailbox {
                 Some(selected_mailbox) if selected_mailbox.id == mailbox => {
                     // Write updated modseq
                     if is_qresync {
                         self.write_bytes(
-                            HighestModSeq::new(last_change_id.to_modseq()).into_bytes(),
+                            HighestModSeq::new(last_change_id.unwrap_or_default().to_modseq())
+                                .into_bytes(),
                         )
                         .await?;
                     }
 
-                    selected_mailbox.append_messages(created_ids, last_change_id)
+                    selected_mailbox.append_messages(created_ids, last_change_id);
                 }
-                _ => self
-                    .get_uid_validity(&mailbox)
-                    .await
-                    .imap_ctx(&arguments.tag, trc::location!())?,
+                _ => {}
             };
+            let uid_validity = self
+                .mailbox_state(&mailbox)
+                .map(|m| m.uid_validity as u32)
+                .unwrap_or_default();
 
             response = response.with_code(ResponseCode::AppendUid { uid_validity, uids });
         }

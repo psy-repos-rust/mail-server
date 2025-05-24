@@ -20,7 +20,12 @@ impl EventType {
                 | StoreEvent::SqlQuery
                 | StoreEvent::LdapQuery
                 | StoreEvent::LdapBind => Level::Trace,
-                StoreEvent::NotFound | StoreEvent::HttpStoreFetch => Level::Debug,
+                StoreEvent::CacheMiss
+                | StoreEvent::CacheHit
+                | StoreEvent::CacheStale
+                | StoreEvent::CacheUpdate
+                | StoreEvent::NotFound
+                | StoreEvent::HttpStoreFetch => Level::Debug,
                 StoreEvent::AssertValueFailed
                 | StoreEvent::FoundationdbError
                 | StoreEvent::MysqlError
@@ -356,18 +361,15 @@ impl EventType {
                 PushSubscriptionEvent::Success => Level::Trace,
             },
             EventType::Cluster(event) => match event {
-                ClusterEvent::PeerAlive
-                | ClusterEvent::PeerDiscovered
-                | ClusterEvent::PeerOffline
-                | ClusterEvent::PeerSuspected
-                | ClusterEvent::PeerSuspectedIsAlive
-                | ClusterEvent::PeerBackOnline
-                | ClusterEvent::PeerLeaving => Level::Info,
-                ClusterEvent::PeerHasChanges | ClusterEvent::OneOrMorePeersOffline => Level::Debug,
-                ClusterEvent::EmptyPacket
-                | ClusterEvent::Error
-                | ClusterEvent::DecryptionError
-                | ClusterEvent::InvalidPacket => Level::Warn,
+                ClusterEvent::SubscriberStart
+                | ClusterEvent::SubscriberStop
+                | ClusterEvent::PublisherStart
+                | ClusterEvent::PublisherStop => Level::Info,
+                ClusterEvent::SubscriberDisconnected => Level::Warn,
+                ClusterEvent::MessageReceived | ClusterEvent::MessageSkipped => Level::Trace,
+                ClusterEvent::PublisherError
+                | ClusterEvent::SubscriberError
+                | ClusterEvent::MessageInvalid => Level::Error,
             },
             EventType::Housekeeper(event) => match event {
                 HousekeeperEvent::Start | HousekeeperEvent::Stop => Level::Info,
@@ -532,6 +534,8 @@ impl EventType {
                 AiEvent::LlmResponse => Level::Trace,
                 AiEvent::ApiError => Level::Warn,
             },
+            EventType::WebDav(_) => Level::Debug,
+            EventType::Calendar(CalendarEvent::RuleExpansionError) => Level::Debug,
         }
     }
 }

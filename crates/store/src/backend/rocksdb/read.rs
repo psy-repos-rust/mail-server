@@ -7,12 +7,12 @@
 use roaring::RoaringBitmap;
 use rocksdb::{Direction, IteratorMode};
 
-use super::{into_error, RocksDbStore};
+use super::{RocksDbStore, into_error};
 
 use crate::{
+    BitmapKey, Deserialize, IterateParams, Key, U32_LEN, ValueKey,
     backend::rocksdb::CfHandle,
-    write::{key::DeserializeBigEndian, BitmapClass, ValueClass},
-    BitmapKey, Deserialize, IterateParams, Key, ValueKey, U32_LEN,
+    write::{BitmapClass, ValueClass, key::DeserializeBigEndian},
 };
 
 impl RocksDbStore {
@@ -41,7 +41,7 @@ impl RocksDbStore {
 
     pub(crate) async fn get_bitmap(
         &self,
-        mut key: BitmapKey<BitmapClass<u32>>,
+        mut key: BitmapKey<BitmapClass>,
     ) -> trc::Result<Option<RoaringBitmap>> {
         let db = self.db.clone();
         self.spawn_worker(move || {
@@ -104,7 +104,7 @@ impl RocksDbStore {
 
     pub(crate) async fn get_counter(
         &self,
-        key: impl Into<ValueKey<ValueClass<u32>>> + Sync + Send,
+        key: impl Into<ValueKey<ValueClass>> + Sync + Send,
     ) -> trc::Result<i64> {
         let key = key.into();
         let db = self.db.clone();

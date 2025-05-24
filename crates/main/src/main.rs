@@ -4,15 +4,16 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Duration;
+#![warn(clippy::large_futures)]
 
 use common::{config::server::ServerProtocol, core::BuildServer, manager::boot::BootManager};
-use directory::backend::internal::MigrateDirectory;
+use http::HttpSessionManager;
 use imap::core::ImapSessionManager;
-use jmap::{api::JmapSessionManager, services::gossip::spawn::GossiperBuilder, StartServices};
 use managesieve::core::ManageSieveSessionManager;
 use pop3::Pop3SessionManager;
-use smtp::{core::SmtpSessionManager, StartQueueManager};
+use services::{StartServices, broadcast::subscriber::spawn_broadcast_subscriber};
+use smtp::{StartQueueManager, core::SmtpSessionManager};
+use std::time::Duration;
 use trc::Collector;
 use utils::wait_for_shutdown;
 
@@ -26,30 +27,29 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     // Load config and apply macros
-    let mut init = BootManager::init().await;
+    let mut init = Box::pin(BootManager::init()).await;
+
+    // Migrate database
+    if let Err(err) = migration::try_migrate(&init.inner.build_server()).await {
+        trc::event!(
+            Server(trc::ServerEvent::StartupError),
+            Details = "Failed to migrate database, aborting startup.",
+            Reason = err,
+        );
+        return Ok(());
+    }
 
     // Init services
     init.start_services().await;
     init.start_queue_manager();
-    let gossiper = GossiperBuilder::try_parse(&mut init.config);
 
     // Log configuration errors
     init.config.log_errors();
     init.config.log_warnings();
 
-    {
-        let server = init.inner.build_server();
-
-        // Log licensing information
-        #[cfg(feature = "enterprise")]
-        server.log_license_details();
-
-        // Migrate directory
-        if let Err(err) = server.store().migrate_directory().await {
-            trc::error!(err.details("Directory migration failed"));
-            std::process::exit(1);
-        }
-    }
+    // Log licensing information
+    #[cfg(feature = "enterprise")]
+    init.inner.build_server().log_license_details();
 
     // Spawn servers
     let (shutdown_tx, shutdown_rx) = init.servers.spawn(|server, acceptor, shutdown_rx| {
@@ -61,7 +61,7 @@ async fn main() -> std::io::Result<()> {
                 shutdown_rx,
             ),
             ServerProtocol::Http => server.spawn(
-                JmapSessionManager::new(init.inner.clone()),
+                HttpSessionManager::new(init.inner.clone()),
                 init.inner.clone(),
                 acceptor,
                 shutdown_rx,
@@ -87,10 +87,8 @@ async fn main() -> std::io::Result<()> {
         };
     });
 
-    // Spawn gossip
-    if let Some(gossiper) = gossiper {
-        gossiper.spawn(init.inner, shutdown_rx.clone()).await;
-    }
+    // Start broadcast subscriber
+    spawn_broadcast_subscriber(init.inner, shutdown_rx);
 
     // Wait for shutdown signal
     wait_for_shutdown().await;

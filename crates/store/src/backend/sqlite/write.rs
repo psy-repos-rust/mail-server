@@ -4,37 +4,54 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use roaring::RoaringBitmap;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::{
-    write::{
-        key::DeserializeBigEndian, AssignedIds, Batch, BitmapClass, Operation, RandomAvailableId,
-        ValueOp,
-    }, BitmapKey, IndexKey, Key, LogKey, SUBSPACE_COUNTER, SUBSPACE_IN_MEMORY_COUNTER, SUBSPACE_QUOTA, U32_LEN
+    IndexKey, Key, LogKey, SUBSPACE_COUNTER, SUBSPACE_IN_MEMORY_COUNTER, SUBSPACE_QUOTA, U64_LEN,
+    write::{AssignedIds, Batch, BitmapClass, Operation, ValueClass, ValueOp},
 };
 
-use super::{into_error, SqliteStore};
+use super::{SqliteStore, into_error};
 
 impl SqliteStore {
-    pub(crate) async fn write(&self, batch: Batch) -> trc::Result<AssignedIds> {
+    pub(crate) async fn write(&self, batch: Batch<'_>) -> trc::Result<AssignedIds> {
         let mut conn = self.conn_pool.get().map_err(into_error)?;
         self.spawn_worker(move || {
             let mut account_id = u32::MAX;
             let mut collection = u8::MAX;
             let mut document_id = u32::MAX;
-            let mut change_id = u64::MAX;
+            let mut change_id = 0u64;
             let trx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(into_error)?;
             let mut result = AssignedIds::default();
+            let has_changes = !batch.changes.is_empty();
 
-            for op in &batch.ops {
+            if has_changes {
+                for &account_id in batch.changes.keys() {
+                    let key = ValueClass::ChangeId.serialize(account_id, 0, 0, 0);
+                    let change_id = trx
+                        .prepare_cached(concat!(
+                            "INSERT INTO n (k, v) VALUES (?, ?) ",
+                            "ON CONFLICT(k) DO UPDATE SET v = v + ",
+                            "excluded.v RETURNING v"
+                        ))
+                        .map_err(into_error)?
+                        .query_row(params![&key, &1i64], |row| row.get::<_, i64>(0))
+                        .map_err(into_error)?;
+                    result.push_change_id(account_id, change_id as u64);
+                }
+            }
+
+            for op in batch.ops.iter_mut() {
                 match op {
                     Operation::AccountId {
                         account_id: account_id_,
                     } => {
                         account_id = *account_id_;
+                        if has_changes {
+                            change_id = result.last_change_id(account_id)?;
+                        }
                     }
                     Operation::Collection {
                         collection: collection_,
@@ -46,29 +63,26 @@ impl SqliteStore {
                     } => {
                         document_id = *document_id_;
                     }
-                    Operation::ChangeId {
-                        change_id: change_id_,
-                    } => {
-                        change_id = *change_id_;
-                    }
                     Operation::Value { class, op } => {
-                        let key = class.serialize(
-                            account_id,
-                            collection,
-                            document_id,
-                            0,
-                            (&result).into(),
-                        );
+                        let key = class.serialize(account_id, collection, document_id, 0);
                         let table = char::from(class.subspace(collection));
 
                         match op {
-                            ValueOp::Set(value) => {
+                            ValueOp::Set {
+                                value,
+                                version_offset,
+                            } => {
+                                if let Some(offset) = version_offset {
+                                    value[*offset..*offset + U64_LEN]
+                                        .copy_from_slice(&change_id.to_be_bytes());
+                                }
+
                                 trx.prepare_cached(&format!(
                                     "INSERT OR REPLACE INTO {} (k, v) VALUES (?, ?)",
                                     table
                                 ))
                                 .map_err(into_error)?
-                                .execute([&key, value.resolve(&result)?.as_ref()])
+                                .execute([&key, value])
                                 .map_err(into_error)?;
                             }
                             ValueOp::AtomicAdd(by) => {
@@ -103,7 +117,7 @@ impl SqliteStore {
                                         table
                                     ))
                                     .map_err(into_error)?
-                                    .query_row(params![&key, &by], |row| row.get::<_, i64>(0))
+                                    .query_row(params![&key, &*by], |row| row.get::<_, i64>(0))
                                     .map_err(into_error)?,
                                 );
                             }
@@ -121,7 +135,7 @@ impl SqliteStore {
                             collection,
                             document_id,
                             field: *field,
-                            key,
+                            key: &*key,
                         }
                         .serialize(0);
 
@@ -138,51 +152,8 @@ impl SqliteStore {
                         }
                     }
                     Operation::Bitmap { class, set } => {
-                        // Find the next available document id
                         let is_document_id = matches!(class, BitmapClass::DocumentIds);
-                        if *set && is_document_id && document_id == u32::MAX {
-                            let begin = BitmapKey {
-                                account_id,
-                                collection,
-                                class: BitmapClass::DocumentIds,
-                                document_id: 0,
-                            }
-                            .serialize(0);
-                            let end = BitmapKey {
-                                account_id,
-                                collection,
-                                class: BitmapClass::DocumentIds,
-                                document_id: u32::MAX,
-                            }
-                            .serialize(0);
-                            let key_len = begin.len();
-
-                            let mut query = trx
-                                .prepare_cached("SELECT k FROM b WHERE k >= ? AND k <= ?")
-                                .map_err(into_error)?;
-                            let mut rows = query.query([&begin, &end]).map_err(into_error)?;
-                            let mut found_ids = RoaringBitmap::new();
-                            while let Some(row) = rows.next().map_err(into_error)? {
-                                let key = row
-                                    .get_ref(0)
-                                    .map_err(into_error)?
-                                    .as_bytes()
-                                    .map_err(into_error)?;
-                                if key.len() == key_len {
-                                    found_ids.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
-                                }
-                            }
-
-                            document_id = found_ids.random_available_id();
-                            result.push_document_id(document_id);
-                        }
-                        let key = class.serialize(
-                            account_id,
-                            collection,
-                            document_id,
-                            0,
-                            (&result).into(),
-                        );
+                        let key = class.serialize(account_id, collection, document_id, 0);
                         let table = char::from(class.subspace());
 
                         if *set {
@@ -207,30 +178,24 @@ impl SqliteStore {
                                 .map_err(into_error)?;
                         };
                     }
-                    Operation::Log { set } => {
+                    Operation::Log { collection, set } => {
                         let key = LogKey {
                             account_id,
-                            collection,
+                            collection: *collection,
                             change_id,
                         }
                         .serialize(0);
 
                         trx.prepare_cached("INSERT OR REPLACE INTO l (k, v) VALUES (?, ?)")
                             .map_err(into_error)?
-                            .execute([&key, set.resolve(&result).map_err(into_error)?.as_ref()])
+                            .execute([&key, set])
                             .map_err(into_error)?;
                     }
                     Operation::AssertValue {
                         class,
                         assert_value,
                     } => {
-                        let key = class.serialize(
-                            account_id,
-                            collection,
-                            document_id,
-                            0,
-                            (&result).into(),
-                        );
+                        let key = class.serialize(account_id, collection, document_id, 0);
                         let table = char::from(class.subspace(collection));
 
                         let matches = trx

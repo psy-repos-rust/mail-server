@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::config::smtp::queue::RequireOptional;
 use common::Server;
+use common::config::smtp::queue::RequireOptional;
 use mail_send::Credentials;
 use smtp_proto::{
-    EhloResponse, Severity, EXT_CHUNKING, EXT_DSN, EXT_REQUIRE_TLS, EXT_SIZE, EXT_SMTP_UTF8,
-    MAIL_REQUIRETLS, MAIL_RET_FULL, MAIL_RET_HDRS, MAIL_SMTPUTF8, RCPT_NOTIFY_DELAY,
-    RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS,
+    EXT_CHUNKING, EXT_DSN, EXT_REQUIRE_TLS, EXT_SIZE, EXT_SMTP_UTF8, EhloResponse, MAIL_REQUIRETLS,
+    MAIL_RET_FULL, MAIL_RET_HDRS, MAIL_SMTPUTF8, RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE,
+    RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS, Severity,
 };
 use std::time::Duration;
 use std::{fmt::Write, time::Instant};
@@ -22,7 +22,7 @@ use crate::queue::{ErrorDetails, HostResponse, RCPT_STATUS_CHANGED};
 
 use crate::queue::{Error, Message, Recipient, Status};
 
-use super::{client::SmtpClient, TlsStrategy};
+use super::{TlsStrategy, client::SmtpClient};
 
 pub struct SessionParams<'x> {
     pub server: &'x Server,
@@ -181,7 +181,7 @@ impl Message {
                         accepted_rcpts.push((
                             rcpt,
                             Status::Completed(HostResponse {
-                                hostname: params.hostname.to_string(),
+                                hostname: params.hostname.into(),
                                 response,
                             }),
                         ));
@@ -199,8 +199,8 @@ impl Message {
 
                         let response = HostResponse {
                             hostname: ErrorDetails {
-                                entity: params.hostname.to_string(),
-                                details: cmd.trim().to_string(),
+                                entity: params.hostname.into(),
+                                details: cmd.trim().into(),
                             },
                             response,
                         };
@@ -345,11 +345,8 @@ impl Message {
 
                                     let response = HostResponse {
                                         hostname: ErrorDetails {
-                                            entity: params.hostname.to_string(),
-                                            details: bdat_cmd
-                                                .as_deref()
-                                                .unwrap_or("DATA")
-                                                .to_string(),
+                                            entity: params.hostname.into(),
+                                            details: bdat_cmd.as_deref().unwrap_or("DATA").into(),
                                         },
                                         response,
                                     };

@@ -7,11 +7,11 @@
 use std::time::{Duration, Instant};
 
 use common::{
+    Core,
     config::smtp::{
         report::AggregateFrequency,
         resolver::{Mode, MxPattern, Policy},
     },
-    Core,
 };
 use mail_auth::MX;
 
@@ -87,7 +87,10 @@ async fn lookup_ip() {
     let resolve_result = test
         .server
         .resolve_host(
-            &NextHop::MX("mx.foobar.org"),
+            &NextHop::MX {
+                host: "mx.foobar.org",
+                is_implicit: false,
+            },
             &RecipientDomain::new("envelope"),
             2,
             0,
@@ -98,9 +101,11 @@ async fn lookup_ip() {
         std::net::IpAddr::V4(v4) => v4,
         _ => unreachable!(),
     }));
-    assert!(resolve_result
-        .remote_ips
-        .contains(&"172.168.0.100".parse().unwrap()));
+    assert!(
+        resolve_result
+            .remote_ips
+            .contains(&"172.168.0.100".parse().unwrap())
+    );
 
     // Ipv6 strategy
     let mut config = Config::new(CONFIG_V6).unwrap();
@@ -122,7 +127,10 @@ async fn lookup_ip() {
     let resolve_result = test
         .server
         .resolve_host(
-            &NextHop::MX("mx.foobar.org"),
+            &NextHop::MX {
+                host: "mx.foobar.org",
+                is_implicit: false,
+            },
             &RecipientDomain::new("envelope"),
             2,
             0,
@@ -133,9 +141,11 @@ async fn lookup_ip() {
         std::net::IpAddr::V6(v6) => v6,
         _ => unreachable!(),
     }));
-    assert!(resolve_result
-        .remote_ips
-        .contains(&"e:f::a".parse().unwrap()));
+    assert!(
+        resolve_result
+            .remote_ips
+            .contains(&"e:f::a".parse().unwrap())
+    );
 }
 
 #[test]
@@ -166,7 +176,7 @@ fn to_remote_hosts() {
     let hosts = mx.to_remote_hosts("domain", 7).unwrap();
     assert_eq!(hosts.len(), 7);
     for host in hosts {
-        if let NextHop::MX(host) = host {
+        if let NextHop::MX { host, .. } = host {
             assert!((*host.as_bytes().last().unwrap() - b'0') <= 8);
         }
     }

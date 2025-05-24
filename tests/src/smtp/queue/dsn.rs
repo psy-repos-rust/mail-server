@@ -6,13 +6,13 @@
 
 use std::{fs, path::PathBuf, time::SystemTime};
 
-use smtp_proto::{Response, RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_SUCCESS};
+use smtp_proto::{RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_SUCCESS, Response};
 use store::write::now;
 use utils::BlobHash;
 
-use crate::smtp::{inbound::sign::SIGNATURES, QueueReceiver, TestSMTP};
+use crate::smtp::{QueueReceiver, TestSMTP, inbound::sign::SIGNATURES};
 use smtp::queue::{
-    dsn::SendDsn, Domain, Error, ErrorDetails, HostResponse, Message, Recipient, Schedule, Status,
+    Domain, Error, ErrorDetails, HostResponse, Message, Recipient, Schedule, Status, dsn::SendDsn,
 };
 
 const CONFIG: &str = r#"
@@ -42,7 +42,7 @@ async fn generate_dsn() {
     path.push("smtp");
     path.push("dsn");
     path.push("original.txt");
-    let size = fs::metadata(&path).unwrap().len() as usize;
+    let size = fs::metadata(&path).unwrap().len() as u64;
     let dsn_original = fs::read_to_string(&path).unwrap();
 
     let flags = RCPT_NOTIFY_FAILURE | RCPT_NOTIFY_DELAY | RCPT_NOTIFY_SUCCESS;
@@ -53,41 +53,41 @@ async fn generate_dsn() {
         created: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
-        return_path: "sender@foobar.org".to_string(),
-        return_path_lcase: "".to_string(),
-        return_path_domain: "foobar.org".to_string(),
+        return_path: "sender@foobar.org".into(),
+        return_path_lcase: "".into(),
+        return_path_domain: "foobar.org".into(),
         recipients: vec![Recipient {
             domain_idx: 0,
-            address: "foobar@example.org".to_string(),
-            address_lcase: "foobar@example.org".to_string(),
+            address: "foobar@example.org".into(),
+            address_lcase: "foobar@example.org".into(),
             status: Status::PermanentFailure(HostResponse {
                 hostname: ErrorDetails {
-                    entity: "mx.example.org".to_string(),
-                    details: "RCPT TO:<foobar@example.org>".to_string(),
+                    entity: "mx.example.org".into(),
+                    details: "RCPT TO:<foobar@example.org>".into(),
                 },
                 response: Response {
                     code: 550,
                     esc: [5, 1, 2],
-                    message: "User does not exist".to_string(),
+                    message: "User does not exist".into(),
                 },
             }),
             flags: 0,
             orcpt: None,
         }],
         domains: vec![Domain {
-            domain: "example.org".to_string(),
+            domain: "example.org".into(),
             retry: Schedule::now(),
             notify: Schedule::now(),
             expires: now() + 10,
             status: Status::TemporaryFailure(Error::ConnectionError(ErrorDetails {
-                entity: "mx.domain.org".to_string(),
-                details: "Connection timeout".to_string(),
+                entity: "mx.domain.org".into(),
+                details: "Connection timeout".into(),
             })),
         }],
         flags: 0,
         env_id: None,
         priority: 0,
-        blob_hash: BlobHash::from(dsn_original.as_bytes()),
+        blob_hash: BlobHash::generate(dsn_original.as_bytes()),
         quota_keys: vec![],
     };
 
@@ -116,14 +116,14 @@ async fn generate_dsn() {
     // Success DSN
     message.recipients.push(Recipient {
         domain_idx: 0,
-        address: "jane@example.org".to_string(),
-        address_lcase: "jane@example.org".to_string(),
+        address: "jane@example.org".into(),
+        address_lcase: "jane@example.org".into(),
         status: Status::Completed(HostResponse {
-            hostname: "mx2.example.org".to_string(),
+            hostname: "mx2.example.org".into(),
             response: Response {
                 code: 250,
                 esc: [2, 1, 5],
-                message: "Message accepted for delivery".to_string(),
+                message: "Message accepted for delivery".into(),
             },
         }),
         flags,
@@ -136,11 +136,11 @@ async fn generate_dsn() {
     // Delay DSN
     message.recipients.push(Recipient {
         domain_idx: 0,
-        address: "john.doe@example.org".to_string(),
-        address_lcase: "john.doe@example.org".to_string(),
+        address: "john.doe@example.org".into(),
+        address_lcase: "john.doe@example.org".into(),
         status: Status::Scheduled,
         flags,
-        orcpt: "jdoe@example.org".to_string().into(),
+        orcpt: Some("jdoe@example.org".into()),
     });
     core.send_dsn(&mut message).await;
     let dsn_message = qr.expect_message().await;
